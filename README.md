@@ -1,93 +1,158 @@
-# Remote
+# Remote PC Manager
 
+A cross-platform desktop app for managing remote PC connections (RDP for now; SSH/SFTP/VNC planned). Passwords are stored in the OS keychain (Windows Credential Manager / macOS Keychain / Linux Secret Service), never in plain text.
 
+Built with **Tauri 2** (Rust backend) + **Vue 3 + TypeScript** (UI).
 
-## Getting started
+---
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
+## Quick start
 
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
+Open terminal in folder: `C:\Users\engineer\Desktop\work\remote`
 
-## Add your files
+1. First time only: `npm install`
+2. Test / run app: `npm run tauri dev`
+3. Build installer: `npm run tauri build`
 
-* [Create](https://docs.gitlab.com/user/project/repository/web_editor/#create-a-file) or [upload](https://docs.gitlab.com/user/project/repository/web_editor/#upload-a-file) files
-* [Add files using the command line](https://docs.gitlab.com/topics/git/add_files/#add-files-to-a-git-repository) or push an existing Git repository with the following command:
+---
+
+## Prerequisites
+
+You need these installed once on your machine:
+
+- **Rust** — install from https://rustup.rs (gives you `rustc` and `cargo`)
+- **Node.js** LTS — https://nodejs.org
+- **WebView2 Runtime** — already on Windows 11 by default
+- Platform build tools:
+  - **Windows:** Microsoft C++ Build Tools (comes with Visual Studio Build Tools)
+  - **macOS:** Xcode Command Line Tools (`xcode-select --install`)
+  - **Linux:** `webkit2gtk-4.1`, `libssl`, `build-essential` (see Tauri prerequisites for your distro)
+
+Verify they are installed:
+
+```powershell
+rustc --version
+node --version
+npm --version
+```
+
+---
+
+## Run the app (no build needed)
+
+```powershell
+npm install        # only the first time
+npm run tauri dev
+```
+
+- **First run:** Rust compiles ~300 dependencies — takes 5–10 minutes. Just wait.
+- **After that:** subsequent runs start in seconds. Code changes hot-reload automatically.
+- A desktop window titled **Remote PC Manager** will open.
+
+`tauri dev` is the right command for development and testing. You do **not** need to run `tauri build` unless you want a final installer.
+
+---
+
+## How to test the app
+
+1. Click **+ New** in the sidebar.
+2. Fill in a connection:
+   - **Name:** any label, e.g. `My work PC`
+   - **Host / IP:** the target machine's IP or hostname
+   - **Port:** `3389` (default RDP port)
+   - **Username:** the Windows user on the remote machine
+   - **Password:** the user's password — saved to **Windows Credential Manager**, not the database
+   - **Protocol:** RDP (only option for now)
+3. Click **Save**.
+4. Click the connection in the list, then **Connect**.
+5. Windows' built-in **mstsc.exe** (Remote Desktop) opens and logs in automatically — no password prompt.
+
+To verify the password really is in the keychain (and not in the DB):
+- Open Windows: **Control Panel → User Accounts → Credential Manager → Windows Credentials**
+- You'll see an entry like `TERMSRV/your-host` while the app holds it.
+
+The SQLite database is stored at:
 
 ```
-cd existing_repo
-git remote add origin https://git.kynoci.com/kynoci/remote.git
-git branch -M main
-git push -uf origin main
+%APPDATA%\com.kynoci.remote\remote.db
 ```
 
-## Integrate with your tools
+It contains the connection metadata (name, host, port, username) but **never the password**.
 
-* [Set up project integrations](https://git.kynoci.com/kynoci/remote/-/settings/integrations)
+---
 
-## Collaborate with your team
+## Build a release installer
 
-* [Invite team members and collaborators](https://docs.gitlab.com/user/project/members/)
-* [Create a new merge request](https://docs.gitlab.com/user/project/merge_requests/creating_merge_requests/)
-* [Automatically close issues from merge requests](https://docs.gitlab.com/user/project/issues/managing_issues/#closing-issues-automatically)
-* [Enable merge request approvals](https://docs.gitlab.com/user/project/merge_requests/approvals/)
-* [Set auto-merge](https://docs.gitlab.com/user/project/merge_requests/auto_merge/)
+When you want to ship a real `.msi` / `.dmg` / `.deb` installer:
 
-## Test and Deploy
+```powershell
+npm run tauri build
+```
 
-Use the built-in continuous integration in GitLab.
+Output goes to `src-tauri/target/release/bundle/`.
 
-* [Get started with GitLab CI/CD](https://docs.gitlab.com/ci/quick_start/)
-* [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/user/application_security/sast/)
-* [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/topics/autodevops/requirements/)
-* [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/user/clusters/agent/)
-* [Set up protected environments](https://docs.gitlab.com/ci/environments/protected_environments/)
+---
 
-***
+## Debugging the built app
 
-# Editing this README
+The built `.exe` has no terminal, so `println!` / `console.log` are not visible by default. Two ways to debug:
 
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
+**1. Open dev tools (F12)**
+Right-click anywhere in the app window → **Inspect Element**, or press **F12 / Ctrl+Shift+I**. Shows the Console tab with all JS logs + errors.
 
-## Suggestions for a good README
+**2. Read the log file**
+All Rust and JS logs are written to:
 
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
+```
+%LOCALAPPDATA%\com.kynoci.remote\logs\Remote PC Manager.log
+```
 
-## Name
-Choose a self-explaining name for your project.
+(macOS: `~/Library/Logs/com.kynoci.remote/`, Linux: `~/.local/share/com.kynoci.remote/logs/`)
 
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
+Open the file in any editor — it appends in real time, so you can watch it while using the app (e.g. `Get-Content -Wait` in PowerShell).
 
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
+---
 
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
+## Cross-platform notes
 
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
+| Platform | RDP launch backend | Status |
+|---|---|---|
+| **Windows** | `cmdkey` + `mstsc.exe` (built into Windows) | Fully implemented |
+| **Linux** | FreeRDP — `xfreerdp3` / `xfreerdp` (install: `sudo apt install freerdp3-x11`, or `freerdp2-x11` on older Ubuntu) | Implemented |
+| **macOS** | FreeRDP — `sdl-freerdp` (install: `brew install freerdp`) | Implemented |
 
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
+On Linux and macOS the app auto-detects the installed FreeRDP client (it probes
+`sdl-freerdp`/`xfreerdp3`/`xfreerdp`, including Homebrew paths on macOS) and
+adjusts its certificate flag for FreeRDP 2 vs 3. The password is passed to
+FreeRDP so login is automatic — no prompt. If FreeRDP isn't installed, **Connect**
+returns an error telling you the exact install command.
 
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
+> **Why FreeRDP on macOS instead of Microsoft Remote Desktop?** The MS app can't
+> accept a password from the command line, so it would always prompt. FreeRDP
+> supports password injection, keeping the "no password prompt" behavior
+> consistent with Windows and Linux.
 
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
+The keychain code uses target-specific Cargo features, so each platform automatically uses its native credential store.
 
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
+---
 
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
+## Project structure
 
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
+```
+src/                 # Vue UI (App.vue is the whole app for now)
+src-tauri/
+  src/lib.rs         # Rust backend: keychain commands + RDP launcher
+  Cargo.toml         # Rust dependencies
+  tauri.conf.json    # App config (window size, title, identifier)
+  capabilities/      # Tauri permission grants for the webview
+```
 
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
+---
 
-## License
-For open source projects, say how it is licensed.
+## Roadmap (next features)
 
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+- M3: SSH terminal (xterm.js + `russh`)
+- M4: SFTP file browser
+- M5: VNC support
+- M6: Connection grouping, search, import from existing `.rdp` / PuTTY profiles
+- M6: Optional master password to lock the app
