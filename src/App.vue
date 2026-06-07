@@ -1,8 +1,26 @@
 <script setup lang="ts">
 import { ref, onMounted, computed, nextTick } from "vue";
 import { invoke, Channel } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import Database from "@tauri-apps/plugin-sql";
 import { SCANCODES } from "./scancodes";
+
+// Custom title-bar window controls (the OS frame is disabled).
+const appWindow = getCurrentWindow();
+const isMaximized = ref(false);
+async function refreshMaximized() {
+  isMaximized.value = await appWindow.isMaximized();
+}
+function winMinimize() {
+  appWindow.minimize();
+}
+async function winToggleMaximize() {
+  await appWindow.toggleMaximize();
+  refreshMaximized();
+}
+function winClose() {
+  appWindow.close();
+}
 
 type Connection = {
   id: number;
@@ -354,6 +372,9 @@ onMounted(async () => {
   window.addEventListener("keydown", keyDown, true);
   window.addEventListener("keyup", keyUp, true);
   window.addEventListener("resize", onWindowResize);
+  // Keep the maximize/restore button in sync with the actual window state.
+  refreshMaximized();
+  appWindow.onResized(() => refreshMaximized());
   try {
     db.value = await Database.load("sqlite:remote.db");
     await loadAll();
@@ -365,25 +386,39 @@ onMounted(async () => {
 
 <template>
   <div class="root">
-    <nav class="tabs" @wheel.prevent="onTabsWheel">
-      <button
-        class="tab"
-        :class="{ active: activeTab === 'home' }"
-        @click="activeTab = 'home'"
-      >
-        Connections
-      </button>
-      <button
-        v-for="s in sessions"
-        :key="s.id"
-        class="tab"
-        :class="{ active: activeTab === s.id }"
-        @click="activeTab = s.id"
-      >
-        <span class="tab-name">{{ s.name }}</span>
-        <span class="tab-close" title="Disconnect" @click.stop="closeTab(s.id)">×</span>
-      </button>
-    </nav>
+    <div class="titlebar" data-tauri-drag-region>
+      <div class="brand" data-tauri-drag-region>
+        <img src="/app-icon.png" class="brand-icon" alt="" data-tauri-drag-region />
+        <span class="brand-title" data-tauri-drag-region>Remote PC Manager</span>
+      </div>
+      <nav class="tabs" @wheel.prevent="onTabsWheel">
+        <button
+          class="tab"
+          :class="{ active: activeTab === 'home' }"
+          @click="activeTab = 'home'"
+        >
+          Connections
+        </button>
+        <button
+          v-for="s in sessions"
+          :key="s.id"
+          class="tab"
+          :class="{ active: activeTab === s.id }"
+          @click="activeTab = s.id"
+        >
+          <span class="tab-name">{{ s.name }}</span>
+          <span class="tab-close" title="Disconnect" @click.stop="closeTab(s.id)">×</span>
+        </button>
+      </nav>
+      <div class="drag-spacer" data-tauri-drag-region></div>
+      <div class="window-controls">
+        <button class="win-btn" title="Minimize" @click="winMinimize">—</button>
+        <button class="win-btn" :title="isMaximized ? 'Restore' : 'Maximize'" @click="winToggleMaximize">
+          {{ isMaximized ? "❐" : "▢" }}
+        </button>
+        <button class="win-btn close" title="Close" @click="winClose">✕</button>
+      </div>
+    </div>
 
   <div class="app" v-show="activeTab === 'home'">
     <aside class="sidebar">
@@ -517,22 +552,65 @@ body, html, #app { margin: 0; height: 100%; }
   height: 100vh;
 }
 
-.tabs {
+/* Custom title bar: tabs + drag region + window controls, all in one row. */
+.titlebar {
   display: flex;
   align-items: stretch;
   flex: 0 0 38px;
   background: #1f1f23;
   border-bottom: 1px solid #2a2a2e;
+  position: relative;
+  z-index: 100;
+}
+/* App icon + title on the far left of the title bar. */
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+  padding: 0 12px;
+  user-select: none;
+}
+.brand-icon { width: 18px; height: 18px; }
+.brand-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: #e4e4e7;
+  white-space: nowrap;
+}
+
+.tabs {
+  display: flex;
+  align-items: stretch;
+  flex: 0 1 auto;
+  min-width: 0;
   /* Scroll horizontally only; never show a vertical scrollbar. */
   overflow-x: auto;
   overflow-y: hidden;
-  /* Always sits above the session panes. */
-  position: relative;
-  z-index: 100;
 }
 .tabs::-webkit-scrollbar { height: 6px; }
 .tabs::-webkit-scrollbar-thumb { background: #3f3f46; border-radius: 3px; }
 .tabs::-webkit-scrollbar-track { background: transparent; }
+
+/* Draggable empty area between tabs and the window controls. */
+.drag-spacer { flex: 1 1 auto; min-width: 24px; }
+
+.window-controls { display: flex; flex: 0 0 auto; }
+.win-btn {
+  width: 46px;
+  height: 38px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  color: #c5c5cb;
+  font-size: 12px;
+  cursor: pointer;
+}
+.win-btn:hover { background: #2f2f35; color: #fff; }
+.win-btn.close:hover { background: #c81e1e; color: #fff; }
 .tab {
   display: flex;
   align-items: center;

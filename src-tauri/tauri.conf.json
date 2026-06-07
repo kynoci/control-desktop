@@ -14,7 +14,8 @@
       {
         "title": "Remote PC Manager",
         "width": 1000,
-        "height": 700
+        "height": 700,
+        "decorations": false
       }
     ],
     "security": {
