@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, computed, nextTick } from "vue";
+import { ref, onMounted, nextTick } from "vue";
 import { invoke, Channel } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import Database from "@tauri-apps/plugin-sql";
@@ -54,14 +54,10 @@ const blankDraft = (): Draft => ({
 
 const db = ref<Database | null>(null);
 const connections = ref<Connection[]>([]);
-const selectedId = ref<number | null>(null);
 const draft = ref<Draft>(blankDraft());
 const editing = ref(false);
 const status = ref<string>("");
-
-const selected = computed(() =>
-  connections.value.find((c) => c.id === selectedId.value) ?? null,
-);
+const sidebarCollapsed = ref(false);
 
 async function loadAll() {
   if (!db.value) return;
@@ -72,19 +68,17 @@ async function loadAll() {
 
 function newConnection() {
   draft.value = blankDraft();
-  selectedId.value = null;
   editing.value = true;
 }
 
-function editSelected() {
-  if (!selected.value) return;
+function editConn(c: Connection) {
   draft.value = {
-    id: selected.value.id,
-    name: selected.value.name,
-    host: selected.value.host,
-    port: selected.value.port,
-    username: selected.value.username,
-    protocol: selected.value.protocol,
+    id: c.id,
+    name: c.name,
+    host: c.host,
+    port: c.port,
+    username: c.username,
+    protocol: c.protocol,
     password: "",
   };
   editing.value = true;
@@ -116,7 +110,6 @@ async function saveDraft() {
       await invoke("save_password", { connectionId: id, password: d.password });
     }
     await loadAll();
-    selectedId.value = id;
     editing.value = false;
     status.value = "Saved";
   } catch (e) {
@@ -124,14 +117,12 @@ async function saveDraft() {
   }
 }
 
-async function deleteSelected() {
-  if (!db.value || !selected.value) return;
-  const id = selected.value.id;
-  if (!confirm(`Delete "${selected.value.name}"?`)) return;
+async function deleteConn(c: Connection) {
+  if (!db.value) return;
+  if (!confirm(`Delete "${c.name}"?`)) return;
   try {
-    await db.value.execute("DELETE FROM connections WHERE id=$1", [id]);
-    await invoke("delete_password", { connectionId: id });
-    selectedId.value = null;
+    await db.value.execute("DELETE FROM connections WHERE id=$1", [c.id]);
+    await invoke("delete_password", { connectionId: c.id });
     await loadAll();
     status.value = "Deleted";
   } catch (e) {
@@ -140,9 +131,7 @@ async function deleteSelected() {
 }
 
 // Native Windows fallback: hand off to mstsc.exe in its own window.
-async function connectMstsc() {
-  if (!selected.value) return;
-  const c = selected.value;
+async function connectMstsc(c: Connection) {
   try {
     status.value = `Launching Windows RDP for ${c.name}...`;
     await invoke("connect_rdp", {
@@ -307,9 +296,7 @@ function onWindowResize() {
   }, 250);
 }
 
-async function connectBuiltin() {
-  if (!selected.value) return;
-  const c = selected.value;
+async function connectBuiltin(c: Connection) {
   const id = nextSessionId++;
   runtimes.set(id, { canvas: null, ctx: null, width: 0, height: 0, lastX: -1, lastY: -1 });
   sessions.value.push({ id, name: c.name, status: `Connecting to ${c.name}...` });
@@ -421,8 +408,17 @@ onMounted(async () => {
     </div>
 
   <div class="app" v-show="activeTab === 'home'">
-    <aside class="sidebar">
+    <button
+      v-show="sidebarCollapsed"
+      class="sidebar-expand"
+      title="Show connections"
+      @click="sidebarCollapsed = false"
+    >
+      ☰
+    </button>
+    <aside class="sidebar" :class="{ collapsed: sidebarCollapsed }">
       <div class="sidebar-header">
+        <button class="icon-btn" title="Collapse" @click="sidebarCollapsed = true">‹</button>
         <h2>Connections</h2>
         <button class="primary" @click="newConnection">+ New</button>
       </div>
@@ -430,8 +426,8 @@ onMounted(async () => {
         <li
           v-for="c in connections"
           :key="c.id"
-          :class="{ active: c.id === selectedId }"
-          @click="selectedId = c.id; editing = false"
+          :title="`Connect to ${c.name}`"
+          @click="connectBuiltin(c)"
         >
           <div class="conn-name">{{ c.name }}</div>
           <div class="conn-host">{{ c.username }}@{{ c.host }}:{{ c.port }}</div>
@@ -442,7 +438,7 @@ onMounted(async () => {
       </ul>
     </aside>
 
-    <main class="main">
+    <main class="main" :class="{ shifted: sidebarCollapsed }">
       <section v-if="editing" class="form">
         <h2>{{ draft.id == null ? "New connection" : "Edit connection" }}</h2>
         <label>
@@ -481,24 +477,29 @@ onMounted(async () => {
         </div>
       </section>
 
-      <section v-else-if="selected" class="details">
-        <h2>{{ selected.name }}</h2>
-        <dl>
-          <dt>Host</dt><dd>{{ selected.host }}:{{ selected.port }}</dd>
-          <dt>Username</dt><dd>{{ selected.username }}</dd>
-          <dt>Protocol</dt><dd>{{ selected.protocol.toUpperCase() }}</dd>
-        </dl>
-        <div class="actions">
-          <button class="primary" @click="connectBuiltin">Connect (Built-in)</button>
-          <button @click="connectMstsc">Connect (Windows RDP)</button>
-          <button @click="editSelected">Edit</button>
-          <button class="danger" @click="deleteSelected">Delete</button>
+      <div v-else class="conn-grid">
+        <div
+          v-for="c in connections"
+          :key="c.id"
+          class="conn-card"
+          :title="`Connect to ${c.name}`"
+          @click="connectBuiltin(c)"
+        >
+          <div class="conn-card-actions">
+            <button class="icon-btn" title="Open with Windows RDP" @click.stop="connectMstsc(c)">🖥</button>
+            <button class="icon-btn" title="Edit" @click.stop="editConn(c)">✎</button>
+            <button class="icon-btn danger" title="Delete" @click.stop="deleteConn(c)">🗑</button>
+          </div>
+          <div class="conn-card-name">{{ c.name }}</div>
+          <div class="conn-card-host">{{ c.username }}@{{ c.host }}:{{ c.port }}</div>
+          <span class="conn-card-proto">{{ c.protocol.toUpperCase() }}</span>
         </div>
-      </section>
 
-      <section v-else class="empty-state">
-        <p>Select a connection on the left, or click <strong>+ New</strong> to add one.</p>
-      </section>
+        <button class="conn-card add" @click="newConnection">
+          <span class="plus">＋</span>
+          <span>New connection</span>
+        </button>
+      </div>
 
       <div v-if="status" class="status">{{ status }}</div>
     </main>
@@ -647,23 +648,63 @@ body, html, #app { margin: 0; height: 100%; }
   display: flex;
   flex: 1;
   min-height: 0;
+  position: relative;
 }
 
 .sidebar {
   width: 280px;
+  flex: 0 0 280px;
   border-right: 1px solid #d0d0d5;
   background: #fafafa;
   display: flex;
   flex-direction: column;
+  overflow: hidden;
+  transition: width 0.18s ease, flex-basis 0.18s ease;
+}
+.sidebar.collapsed {
+  width: 0;
+  flex-basis: 0;
+  border-right: none;
 }
 .sidebar-header {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  gap: 8px;
   padding: 12px 14px;
   border-bottom: 1px solid #d0d0d5;
 }
-.sidebar-header h2 { margin: 0; font-size: 15px; }
+.sidebar-header h2 { margin: 0; font-size: 15px; flex: 1; white-space: nowrap; }
+
+.icon-btn {
+  border: none;
+  background: transparent;
+  font-size: 18px;
+  line-height: 1;
+  padding: 2px 8px;
+  border-radius: 6px;
+  color: inherit;
+  cursor: pointer;
+}
+.icon-btn:hover { background: rgba(128, 128, 128, 0.18); }
+
+/* Floating button to reopen the sidebar when collapsed. */
+.sidebar-expand {
+  position: absolute;
+  top: 10px;
+  left: 10px;
+  z-index: 5;
+  width: 34px;
+  height: 30px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid #d0d0d5;
+  border-radius: 7px;
+  background: #fff;
+  font-size: 15px;
+  cursor: pointer;
+}
+.sidebar-expand:hover { background: #f0f0f3; }
 
 .conn-list {
   list-style: none;
@@ -693,6 +734,70 @@ body, html, #app { margin: 0; height: 100%; }
   padding: 24px 32px;
   overflow-y: auto;
 }
+/* Leave room for the floating expand button when the sidebar is hidden. */
+.main.shifted { padding-left: 56px; }
+
+/* Connection cards — click to connect (built-in IronRDP). */
+.conn-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 14px;
+  align-content: start;
+}
+.conn-card {
+  position: relative;
+  min-height: 96px;
+  padding: 14px;
+  border: 1px solid #d8d8de;
+  border-radius: 10px;
+  background: #fff;
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 0.15s, box-shadow 0.15s, transform 0.05s;
+}
+.conn-card:hover { border-color: #b9c6e6; box-shadow: 0 2px 10px rgba(0, 0, 0, 0.07); }
+.conn-card:active { transform: translateY(1px); }
+.conn-card-name { font-weight: 600; font-size: 15px; }
+.conn-card-host { font-size: 12px; color: #666; margin-top: 3px; word-break: break-all; }
+.conn-card-proto {
+  display: inline-block;
+  margin-top: 10px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  color: #3b5bdb;
+  background: #eaf0ff;
+  border-radius: 4px;
+  padding: 2px 6px;
+}
+.conn-card-actions {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  display: flex;
+  gap: 2px;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+.conn-card:hover .conn-card-actions { opacity: 1; }
+.conn-card-actions .icon-btn {
+  font-size: 13px;
+  padding: 3px 6px;
+  background: rgba(255, 255, 255, 0.85);
+}
+.icon-btn.danger { color: #c81e1e; }
+
+.conn-card.add {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  color: #6b7280;
+  border-style: dashed;
+}
+.conn-card.add:hover { color: #2563eb; border-color: #2563eb; background: #f7f9ff; }
+.conn-card.add .plus { font-size: 24px; line-height: 1; }
 
 .form, .details {
   max-width: 480px;
@@ -868,6 +973,20 @@ button.danger:hover { background: #fef2f2; }
   .conn-list li:hover { background: #27272a; }
   .conn-list li.active { background: #1e3a8a; }
   .conn-host { color: #a1a1aa; }
+  .sidebar-expand {
+    background: #27272a;
+    border-color: #3f3f46;
+    color: #e4e4e7;
+  }
+  .sidebar-expand:hover { background: #3f3f46; }
+  .icon-btn:hover { background: rgba(255, 255, 255, 0.12); }
+  .conn-card { background: #1f1f23; border-color: #2f2f35; }
+  .conn-card:hover { border-color: #3b5bdb; box-shadow: 0 2px 12px rgba(0, 0, 0, 0.5); }
+  .conn-card-host { color: #a1a1aa; }
+  .conn-card-proto { color: #9db4ff; background: #1e2a55; }
+  .conn-card-actions .icon-btn { background: rgba(31, 31, 35, 0.85); }
+  .conn-card.add { color: #a1a1aa; }
+  .conn-card.add:hover { color: #93b0ff; border-color: #3b5bdb; background: #20232e; }
   .form input, .form select {
     background: #27272a;
     border-color: #3f3f46;
