@@ -54,6 +54,8 @@ const blankDraft = (): Draft => ({
 
 const db = ref<Database | null>(null);
 const connections = ref<Connection[]>([]);
+// Latest remote-desktop thumbnail per connection id (data URL), cached locally.
+const thumbnails = ref<Record<number, string>>({});
 const draft = ref<Draft>(blankDraft());
 const editing = ref(false);
 const status = ref<string>("");
@@ -64,6 +66,17 @@ async function loadAll() {
   connections.value = await db.value.select<Connection[]>(
     "SELECT id, name, host, port, username, protocol, created_at FROM connections ORDER BY name",
   );
+  loadThumbnails();
+}
+
+// Restore cached thumbnails for the current connections from localStorage.
+function loadThumbnails() {
+  const map: Record<number, string> = {};
+  for (const c of connections.value) {
+    const t = localStorage.getItem(`thumb:${c.id}`);
+    if (t) map[c.id] = t;
+  }
+  thumbnails.value = map;
 }
 
 function newConnection() {
@@ -123,6 +136,7 @@ async function deleteConn(c: Connection) {
   try {
     await db.value.execute("DELETE FROM connections WHERE id=$1", [c.id]);
     await invoke("delete_password", { connectionId: c.id });
+    try { localStorage.removeItem(`thumb:${c.id}`); } catch { /* ignore */ }
     await loadAll();
     status.value = "Deleted";
   } catch (e) {
@@ -173,12 +187,36 @@ type Runtime = {
   height: number;
   lastX: number;
   lastY: number;
+  connId: number; // which saved connection this session belongs to
+  lastThumb: number; // timestamp of the last thumbnail capture
 };
 const runtimes = new Map<number, Runtime>();
 
 function setCanvas(id: number, el: Element | null) {
   const rt = runtimes.get(id);
   if (rt) rt.canvas = (el as HTMLCanvasElement) ?? null;
+}
+
+// Snapshot the session canvas into a small JPEG thumbnail for its connection.
+function captureThumbnail(sessionId: number) {
+  const rt = runtimes.get(sessionId);
+  if (!rt || !rt.canvas || rt.width === 0 || rt.height === 0) return;
+  const tw = 320;
+  const th = Math.max(1, Math.round((tw * rt.height) / rt.width));
+  const off = document.createElement("canvas");
+  off.width = tw;
+  off.height = th;
+  const octx = off.getContext("2d");
+  if (!octx) return;
+  try {
+    octx.drawImage(rt.canvas, 0, 0, tw, th);
+    const url = off.toDataURL("image/jpeg", 0.6);
+    thumbnails.value = { ...thumbnails.value, [rt.connId]: url };
+    localStorage.setItem(`thumb:${rt.connId}`, url);
+    rt.lastThumb = Date.now();
+  } catch {
+    /* canvas not ready / storage full — skip this capture */
+  }
 }
 
 function setStatus(id: number, text: string) {
@@ -211,6 +249,8 @@ function handleFrame(id: number, data: ArrayBuffer | unknown) {
     if (rgba.length === rt.width * h * 4) {
       rt.ctx.putImageData(new ImageData(rgba, rt.width, h), 0, y);
     }
+    // Refresh the connection thumbnail at most every few seconds.
+    if (Date.now() - rt.lastThumb > 4000) captureThumbnail(id);
   } else if (tag === 2) {
     // status: [2][utf-8 message] — a disconnect/close/error notice.
     setStatus(id, new TextDecoder().decode(new Uint8Array(data, 1)));
@@ -298,7 +338,10 @@ function onWindowResize() {
 
 async function connectBuiltin(c: Connection) {
   const id = nextSessionId++;
-  runtimes.set(id, { canvas: null, ctx: null, width: 0, height: 0, lastX: -1, lastY: -1 });
+  runtimes.set(id, {
+    canvas: null, ctx: null, width: 0, height: 0, lastX: -1, lastY: -1,
+    connId: c.id, lastThumb: 0,
+  });
   sessions.value.push({ id, name: c.name, status: `Connecting to ${c.name}...` });
   activeTab.value = id;
   await nextTick();
@@ -333,6 +376,8 @@ async function connectBuiltin(c: Connection) {
 
 async function closeTab(id: number) {
   const idx = sessions.value.findIndex((s) => s.id === id);
+  // Grab a final snapshot of the remote before tearing the session down.
+  captureThumbnail(id);
   try {
     await invoke("rdp_disconnect", { sessionId: id });
   } catch {
@@ -490,9 +535,15 @@ onMounted(async () => {
             <button class="icon-btn" title="Edit" @click.stop="editConn(c)">✎</button>
             <button class="icon-btn danger" title="Delete" @click.stop="deleteConn(c)">🗑</button>
           </div>
-          <div class="conn-card-name">{{ c.name }}</div>
-          <div class="conn-card-host">{{ c.username }}@{{ c.host }}:{{ c.port }}</div>
-          <span class="conn-card-proto">{{ c.protocol.toUpperCase() }}</span>
+          <div class="conn-card-thumb">
+            <img v-if="thumbnails[c.id]" :src="thumbnails[c.id]" alt="" />
+            <span v-else class="conn-card-thumb-empty">🖥</span>
+          </div>
+          <div class="conn-card-info">
+            <div class="conn-card-name">{{ c.name }}</div>
+            <div class="conn-card-host">{{ c.username }}@{{ c.host }}:{{ c.port }}</div>
+            <span class="conn-card-proto">{{ c.protocol.toUpperCase() }}</span>
+          </div>
         </div>
 
         <button class="conn-card add" @click="newConnection">
@@ -746,8 +797,8 @@ body, html, #app { margin: 0; height: 100%; }
 }
 .conn-card {
   position: relative;
-  min-height: 96px;
-  padding: 14px;
+  padding: 0;
+  overflow: hidden;
   border: 1px solid #d8d8de;
   border-radius: 10px;
   background: #fff;
@@ -757,6 +808,17 @@ body, html, #app { margin: 0; height: 100%; }
 }
 .conn-card:hover { border-color: #b9c6e6; box-shadow: 0 2px 10px rgba(0, 0, 0, 0.07); }
 .conn-card:active { transform: translateY(1px); }
+.conn-card-thumb {
+  aspect-ratio: 16 / 10;
+  background: #0b0b0e;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+}
+.conn-card-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.conn-card-thumb-empty { font-size: 30px; opacity: 0.35; }
+.conn-card-info { padding: 11px 13px; }
 .conn-card-name { font-weight: 600; font-size: 15px; }
 .conn-card-host { font-size: 12px; color: #666; margin-top: 3px; word-break: break-all; }
 .conn-card-proto {
@@ -793,6 +855,8 @@ body, html, #app { margin: 0; height: 100%; }
   align-items: center;
   justify-content: center;
   gap: 4px;
+  min-height: 180px;
+  padding: 20px;
   color: #6b7280;
   border-style: dashed;
 }
