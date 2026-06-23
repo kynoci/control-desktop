@@ -1,4 +1,4 @@
-# Remote PC Manager
+# Control Desktop
 
 A cross-platform desktop app for managing remote PC connections over **RDP** and **VNC** (SSH/SFTP planned). It ships **embedded, pure-Rust clients** for both protocols — clicking a connection opens a live remote desktop in a tab, no external program required. Passwords are stored in the OS keychain (Windows Credential Manager / macOS Keychain / Linux Secret Service), never in plain text.
 
@@ -47,7 +47,7 @@ npm run tauri dev
 
 - **First run:** Rust compiles ~300 dependencies — takes 5–10 minutes. Just wait.
 - **After that:** subsequent runs start in seconds. Code changes hot-reload automatically.
-- A desktop window titled **Remote PC Manager** will open.
+- A desktop window titled **Control Desktop** will open.
 
 `tauri dev` is the right command for development and testing. You do **not** need to run `tauri build` unless you want a final installer.
 
@@ -108,7 +108,7 @@ Right-click anywhere in the app window → **Inspect Element**, or press **F12 /
 All Rust and JS logs are written to:
 
 ```
-%LOCALAPPDATA%\com.kynoci.remote\logs\Remote PC Manager.log
+%LOCALAPPDATA%\com.kynoci.remote\logs\Control Desktop.log
 ```
 
 (macOS: `~/Library/Logs/com.kynoci.remote/`, Linux: `~/.local/share/com.kynoci.remote/logs/`)

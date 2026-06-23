@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Remote PC Manager",
+  "productName": "Control Desktop",
   "version": "0.1.0",
   "identifier": "com.kynoci.remote",
   "build": {
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "Remote PC Manager",
+        "title": "Control Desktop",
         "width": 1000,
         "height": 700,
         "decorations": false

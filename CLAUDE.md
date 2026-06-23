@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A cross-platform desktop **Remote PC Manager** (RDP) built with **Tauri 2** (Rust backend) + **Vue 3 / TypeScript** (UI). Connection metadata lives in SQLite; passwords live only in the OS keychain, never in the DB.
+A cross-platform desktop **Control Desktop** remote-access app (RDP + VNC) built with **Tauri 2** (Rust backend) + **Vue 3 / TypeScript** (UI). Connection metadata lives in SQLite; passwords live only in the OS keychain, never in the DB.
 
 ## Commands
 
@@ -69,4 +69,4 @@ Connection paths share one credential/DB layer. Clicking a connection card uses 
 
 ## Debugging
 
-The built `.exe` has no console. Use **F12 / Inspect Element** for the JS console, or read the log file at `%LOCALAPPDATA%\com.kynoci.remote\logs\Remote PC Manager.log` (Rust + JS logs append in real time). The `ironrdp_connector` target is pinned to `Debug` level so server disconnects/redirections are diagnosable.
+The built `.exe` has no console. Use **F12 / Inspect Element** for the JS console, or read the log file at `%LOCALAPPDATA%\com.kynoci.remote\logs\Control Desktop.log` (Rust + JS logs append in real time). The `ironrdp_connector` target is pinned to `Debug` level so server disconnects/redirections are diagnosable.

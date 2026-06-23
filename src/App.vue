@@ -465,7 +465,7 @@ onMounted(async () => {
     <div class="titlebar" data-tauri-drag-region>
       <div class="brand" data-tauri-drag-region>
         <img src="/app-icon.png" class="brand-icon" alt="" data-tauri-drag-region />
-        <span class="brand-title" data-tauri-drag-region>Remote PC Manager</span>
+        <span class="brand-title" data-tauri-drag-region>Control Desktop</span>
       </div>
       <nav class="tabs" @wheel.prevent="onTabsWheel">
         <button
