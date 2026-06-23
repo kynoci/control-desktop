@@ -1,6 +1,6 @@
 # Remote PC Manager
 
-A cross-platform desktop app for managing remote PC connections (RDP for now; SSH/SFTP/VNC planned). Passwords are stored in the OS keychain (Windows Credential Manager / macOS Keychain / Linux Secret Service), never in plain text.
+A cross-platform desktop app for managing remote PC connections over **RDP** and **VNC** (SSH/SFTP planned). It ships **embedded, pure-Rust clients** for both protocols — clicking a connection opens a live remote desktop in a tab, no external program required. Passwords are stored in the OS keychain (Windows Credential Manager / macOS Keychain / Linux Secret Service), never in plain text.
 
 Built with **Tauri 2** (Rust backend) + **Vue 3 + TypeScript** (UI).
 
@@ -8,7 +8,7 @@ Built with **Tauri 2** (Rust backend) + **Vue 3 + TypeScript** (UI).
 
 ## Quick start
 
-Open terminal in folder: `C:\Users\engineer\Desktop\work\remote`
+Open terminal in folder: `C:\Users\engineer\Projects\remote2`
 
 1. First time only: `npm install`
 2. Test / run app: `npm run tauri dev`
@@ -59,17 +59,21 @@ npm run tauri dev
 2. Fill in a connection:
    - **Name:** any label, e.g. `My work PC`
    - **Host / IP:** the target machine's IP or hostname
-   - **Port:** `3389` (default RDP port)
-   - **Username:** the Windows user on the remote machine
-   - **Password:** the user's password — saved to **Windows Credential Manager**, not the database
-   - **Protocol:** RDP (only option for now)
+   - **Protocol:** **RDP** or **VNC**
+   - **Port:** auto-fills the protocol default (`3389` for RDP, `5900` for VNC); change it if needed
+   - **Username:** the remote user (RDP needs this; classic VNC ignores it)
+   - **Password:** saved to the **OS keychain**, not the database. For RDP and VNC Auth this is required; a VNC server set to *no authentication* can use a blank password.
 3. Click **Save**.
-4. Click the connection in the list, then **Connect**.
-5. Windows' built-in **mstsc.exe** (Remote Desktop) opens and logs in automatically — no password prompt.
+4. Click the connection card (or its sidebar entry) to connect — the remote desktop opens in a **new tab**, driven by the embedded client. Mouse and keyboard work in the tab; close the tab to disconnect. You can open several sessions at once.
+5. **Windows RDP fallback (optional):** for an RDP connection, the 🖥 button on a card hands off to Windows' built-in **mstsc.exe** in its own window instead of the embedded client.
+
+VNC notes:
+- Supported auth is **None** and **VNC Authentication**. Servers requiring **VeNCrypt/TLS** or **RealVNC** encryption aren't supported yet — you'll get a clear error suggesting you enable standard VNC Auth or use RDP.
+- The server's resolution is fixed; the canvas scales to fit the window.
 
 To verify the password really is in the keychain (and not in the DB):
 - Open Windows: **Control Panel → User Accounts → Credential Manager → Windows Credentials**
-- You'll see an entry like `TERMSRV/your-host` while the app holds it.
+- For the Windows RDP fallback you'll see a `TERMSRV/your-host` entry while the app holds it; embedded sessions read the stored password directly from the keychain.
 
 The SQLite database is stored at:
 
@@ -115,22 +119,21 @@ Open the file in any editor — it appends in real time, so you can watch it whi
 
 ## Cross-platform notes
 
-| Platform | RDP launch backend | Status |
-|---|---|---|
-| **Windows** | `cmdkey` + `mstsc.exe` (built into Windows) | Fully implemented |
-| **Linux** | FreeRDP — `xfreerdp3` / `xfreerdp` (install: `sudo apt install freerdp3-x11`, or `freerdp2-x11` on older Ubuntu) | Implemented |
-| **macOS** | FreeRDP — `sdl-freerdp` (install: `brew install freerdp`) | Implemented |
+Both remote-desktop clients are **embedded and pure-Rust** (RDP via the `ironrdp`
+crates, VNC via `vnc-rs`), so they run on every platform with **no external client
+to install** — no FreeRDP, no separate VNC viewer. This is the primary path on all
+platforms.
 
-On Linux and macOS the app auto-detects the installed FreeRDP client (it probes
-`sdl-freerdp`/`xfreerdp3`/`xfreerdp`, including Homebrew paths on macOS) and
-adjusts its certificate flag for FreeRDP 2 vs 3. The password is passed to
-FreeRDP so login is automatic — no prompt. If FreeRDP isn't installed, **Connect**
-returns an error telling you the exact install command.
+| Client | Backend | Platforms | Status |
+|---|---|---|---|
+| **RDP (embedded)** | `ironrdp` (pure Rust) | Windows / macOS / Linux | Primary path |
+| **VNC (embedded)** | `vnc-rs` (pure Rust) | Windows / macOS / Linux | Implemented (None + VNC Auth) |
+| **RDP via mstsc** | `cmdkey` + `mstsc.exe` | Windows only | Optional fallback (🖥 button) |
 
-> **Why FreeRDP on macOS instead of Microsoft Remote Desktop?** The MS app can't
-> accept a password from the command line, so it would always prompt. FreeRDP
-> supports password injection, keeping the "no password prompt" behavior
-> consistent with Windows and Linux.
+The build stays free of any C/NASM toolchain requirement: `rustls` uses the `ring`
+backend and `vnc-rs` decompresses ZRLE via the pure-Rust `flate2`/`miniz_oxide`.
+TLS certificate verification is intentionally relaxed for embedded RDP (RDP hosts
+usually present self-signed certs on a trusted LAN); classic VNC is plain TCP.
 
 The keychain code uses target-specific Cargo features, so each platform automatically uses its native credential store.
 
@@ -139,9 +142,15 @@ The keychain code uses target-specific Cargo features, so each platform automati
 ## Project structure
 
 ```
-src/                 # Vue UI (App.vue is the whole app for now)
+src/
+  App.vue            # Vue UI: connection manager + tabbed sessions + canvas rendering
+  scancodes.ts       # KeyboardEvent.code -> RDP set-1 scancode map
+  keysyms.ts         # KeyboardEvent -> VNC X11 keysym map
 src-tauri/
-  src/lib.rs         # Rust backend: keychain commands + RDP launcher
+  src/lib.rs         # Rust backend: keychain commands, mstsc fallback, command registration
+  src/rdp.rs         # Embedded IronRDP client (background tokio task + frame streaming)
+  src/vnc.rs         # Embedded VNC/RFB client (vnc-rs), sibling of rdp.rs
+  vendor/            # Patched local copy of ironrdp-connector (see CLAUDE.md)
   Cargo.toml         # Rust dependencies
   tauri.conf.json    # App config (window size, title, identifier)
   capabilities/      # Tauri permission grants for the webview
@@ -151,8 +160,9 @@ src-tauri/
 
 ## Roadmap (next features)
 
-- M3: SSH terminal (xterm.js + `russh`)
-- M4: SFTP file browser
-- M5: VNC support
-- M6: Connection grouping, search, import from existing `.rdp` / PuTTY profiles
-- M6: Optional master password to lock the app
+- ~~VNC support~~ ✅ done (embedded `vnc-rs` client; None + VNC Auth)
+- VNC follow-ups: VeNCrypt/TLS auth, clipboard sync, client-driven resize
+- SSH terminal (xterm.js + `russh`)
+- SFTP file browser
+- Connection grouping, search, import from existing `.rdp` / PuTTY profiles
+- Optional master password to lock the app

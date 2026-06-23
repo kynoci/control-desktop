@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use tauri_plugin_sql::{Migration, MigrationKind};
 
 mod rdp;
+mod vnc;
 
 const KEYRING_SERVICE: &str = "com.kynoci.remote";
 
@@ -149,6 +150,7 @@ pub fn run() {
                 .build(),
         )
         .manage(rdp::RdpState::default())
+        .manage(vnc::VncState::default())
         .invoke_handler(tauri::generate_handler![
             save_password,
             get_password,
@@ -158,6 +160,10 @@ pub fn run() {
             rdp::rdp_input,
             rdp::rdp_resize,
             rdp::rdp_disconnect,
+            vnc::vnc_connect,
+            vnc::vnc_input,
+            vnc::vnc_resize,
+            vnc::vnc_disconnect,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

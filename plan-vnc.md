@@ -56,6 +56,25 @@ We want a **pure-Rust** RFB client to keep the "no C/NASM toolchain" property (t
 
 Risk: some crates assume they own the event loop / render to their own window. We need a *headless* client that hands us pixel rects. Verify this in the spike — it's the make-or-break property.
 
+### Spike findings (2026-06-23) — ✅ `vnc-rs` confirmed as primary
+
+Spiked against vnc-rs **0.5.3** (crates.io package name **`vnc-rs`**, lib name `vnc`, by HsuJv — *not* the unrelated `vnc` 0.4.0 on crates.io). Built a headless test binary + a minimal mock RFB 3.8 server (no live VNC server was available on this machine). All four make-or-break properties pass — at runtime, not just on paper:
+
+- **(a) No C toolchain ✅** — `cargo build` is clean on Windows (rustc 1.94). The only `-sys` crates in the tree are `windows-sys` (pure FFI bindings, already pulled by tokio) and `miniz_oxide` (pure-Rust; flate2's default backend). **Do not enable flate2's `zlib` feature** or it pulls C. DES for VNC Auth is implemented *in-crate* (`src/client/security/des.rs`) — no `des` dep, and the §8 "DES quirk" worry is moot (the crate handles it).
+- **(b) Raw pixel rects ✅** — `poll_event()` yields `VncEvent::RawImage(Rect{x,y,width,height: u16}, Vec<u8>)`. With `set_pixel_format(PixelFormat::rgba())` the bytes arrive as `[r,g,b,a]` in network order (**verified: a red pixel came back `[255,0,0,255]`**). This maps 1:1 to the planned wire tag-3 `[3][x][y][w][h][rgba…]` + `putImageData` — **zero per-pixel swizzling**. (Simplifies §4 "pixel conversion" and §5.)
+- **(c) VNC Auth ✅** — `set_auth_method(async move { Ok(password) })`. Supports **None + VncAuth only**. Wrong password → `VncError::WrongPassword`; no callback set → `VncError::NoPassword`. Any other security type (VeNCrypt=19, RA2, Tls, Tight-security, etc.) fails with `VncError::General("Security type apart from Vnc Auth has not been implemented")` — match on that for the actionable §8 message. Note: if a server offers *both* None and VncAuth, the crate picks None.
+- **(d) Caller-driven loop ✅** — the client spawns its own internal tokio net + decode tasks over mpsc; `poll_event(&self)` is a **non-blocking `try_recv`** (returns `Ok(None)` when idle) and `input(&self)` also takes `&self`, so a single `tokio::select!` over `{cancel, input_rx.recv(), interval.tick()}` drives both — same shape as `rdp.rs` `run_session`. **Must re-send `X11Event::Refresh` each tick** (incremental update request) to keep frames flowing — confirmed (652 rects in 5 s). `X11Event::FullRefresh` forces a full update.
+
+Other facts that change the plan:
+
+- **Encodings to request (v1): `Zrle + CopyRect + Raw` (+ `DesktopSizePseudo`).** **Avoid `Tight` in v1** — Tight subrects come back as `VncEvent::JpegImage(rect, jpeg_bytes)`, which would need a JPEG decode path (base64 `<img>` on the frontend, or a pure-Rust `jpeg-decoder`). ZRLE gives compression via the already-present pure-Rust flate2/miniz_oxide. Available encodings: Raw, CopyRect, Tight, Trle, Zrle, CursorPseudo, DesktopSizePseudo, LastRectPseudo.
+- **CopyRect** arrives as `VncEvent::Copy(dst, src)` — the backend must apply it against the local framebuffer (it's not a single RGBA blit), or just answer with `FullRefresh`. Adjust §4 step 8.
+- **Client-initiated resize is NOT supported.** The crate only surfaces *server*-driven resolution changes via `DesktopSizePseudo` → `VncEvent::SetResolution(Screen)`. There is no client-side `SetDesktopSize` API, so `vnc_resize` (§4/§7) is effectively a no-op — rely on server-fixed size + CSS-scaled canvas (the §10.7 baseline). Treat `vnc_resize` as best-effort/stub.
+- **Input types match §6 exactly:** `X11Event::PointerEvent(ClientMouseEvent { position_x: u16, position_y: u16, bottons: u8 })` (button bitmask — note the upstream typo `bottons`) and `X11Event::KeyEvent(ClientKeyEvent { keycode: u32, down: bool })` where `keycode` is the X11 keysym. Verified end-to-end (pointer + keysym `0x61` reached the mock server).
+- **Builder shape:** `VncConnector::new(tcp).set_auth_method(..).add_encoding(..).allow_shared(true).set_pixel_format(PixelFormat::rgba()).build()?.try_start().await?.finish()?` → `VncClient` (which is `Clone`). `VncEvent` and `X11Event` are `#[non_exhaustive]`, so match arms need a `_ =>`.
+
+**Verdict:** go with `vnc-rs` 0.5.3. No need for the rust-vnc / hand-rolled fallbacks. Spike code lives in the scratchpad (`vnc-spike/`, `src/main.rs` + `src/bin/mock_server.rs`) — not committed.
+
 ---
 
 ## 4. Backend: `vnc.rs` structure
@@ -155,15 +174,17 @@ So the frontend must send keysyms for VNC. Add **`src/keysyms.ts`** mapping `Key
 
 ## 10. Implementation milestones
 
-1. **Spike (½ day):** pick the crate, prove headless connect + pixel rects + VNC Auth against a local server. Update §3.
-2. **Backend skeleton:** `vnc.rs` with `VncState`, the four commands, registration in `lib.rs`. Stub `vnc_connect` that connects, reads `ServerInit`, sends an `init` frame + a status message. Verify a tab opens and shows the negotiated size.
-3. **Framebuffer rendering:** decode updates → local framebuffer → tag-3 rect frames; loop re-requests incremental updates. Frontend tag-3 branch. Goal: see the live remote screen (read-only).
-4. **Pointer input:** button bitmask + move + wheel. Goal: mouse works.
-5. **Keyboard input:** `keysyms.ts` + protocol-aware `onKey` + backend `KeyEvent`. Goal: typing works, including modifiers and shifted symbols.
-6. **Form/UX:** protocol dropdown, default port 5900, hide the Windows-RDP button for VNC, protocol-aware input/disconnect routing.
-7. **Resize (best-effort):** SetDesktopSize if the server advertises it; otherwise letterbox the fixed framebuffer (canvas CSS already scales).
-8. **Hardening:** error messages for unsupported auth, connection-lost handling, cancel/reconnect parity with RDP.
-9. **Docs:** update `CLAUDE.md` (two embedded clients now) and `README.md` (protocol table, VNC notes).
+1. ~~**Spike (½ day):** pick the crate, prove headless connect + pixel rects + VNC Auth against a local server. Update §3.~~ ✅ **Done (2026-06-23)** — `vnc-rs` 0.5.3 confirmed; all four properties verified (build + mock RFB server). See §3 findings.
+2. ~~**Backend skeleton:** `vnc.rs` with `VncState`, the four commands, registration in `lib.rs`.~~ ✅ **Done (2026-06-23)** — full `vnc.rs` (not just a stub), `mod vnc` + `.manage` + handlers in `lib.rs`, `vnc-rs = "0.5"` in `Cargo.toml`. `cargo check` green. No capability change needed (`core:default` covers it, as §9 predicted).
+3. ~~**Framebuffer rendering:** decode updates → local framebuffer → tag-3 rect frames; loop re-requests incremental updates. Frontend tag-3 branch.~~ ✅ **Done** — `handle_event` blits RawImage + applies CopyRect against a local RGBA framebuffer, emits tag-3 rects; 16 ms tick re-arms incremental `Refresh`. `App.vue handleFrame` has the tag-3 branch.
+4. ~~**Pointer input:** button bitmask + move + wheel.~~ ✅ **Done** — `Pointer` tracks position + button bitmask; wheel = press/release of wheel buttons.
+5. ~~**Keyboard input:** `keysyms.ts` + protocol-aware `onKey` + backend `KeyEvent`.~~ ✅ **Done** — `src/keysyms.ts` (printable via `e.key`, named/modifier/keypad via `e.code`); `onKey` branches on session protocol.
+6. ~~**Form/UX:** protocol dropdown, default port 5900, hide the Windows-RDP button for VNC, protocol-aware input/disconnect routing.~~ ✅ **Done** — VNC `<option>`, protocol→port watcher, `🖥` hidden for VNC, `connect`/`input`/`disconnect`/`resize` all routed by `runtime.protocol`. `npm run build` green.
+7. **Resize (best-effort):** ⚠️ **Stubbed** — `vnc_resize` is a logged no-op (vnc-rs 0.5.3 has no client-side `SetDesktopSize`); rely on server-fixed size + CSS-scaled canvas. `SetResolution` events from the server *are* handled (re-init + framebuffer realloc).
+8. **Hardening:** ✅ unsupported-auth + wrong-password messages done (`map_connect_err`); connection-lost surfaces as a status frame. ⏳ No reconnect loop (VNC has no RDP-style handoff disconnect, so likely unneeded — revisit if servers drop post-auth).
+9. ~~**Docs:** update `CLAUDE.md` (two embedded clients) and `README.md` (protocol table, VNC notes).~~ ✅ **Done** — `CLAUDE.md` (architecture, tag-3, vnc commands, keysyms, `vnc.rs` internals) and `README.md` (corrected the stale FreeRDP backend table → embedded pure-Rust clients; added VNC setup/auth notes, project structure, roadmap).
+
+> **⏳ Not yet done: live end-to-end test.** Both build gates pass, but the integrated app has *not* been run against a real VNC server (none available on the dev box). The spike's mock RFB server exercised the crate path; milestone 11's manual matrix (TigerVNC/x11vnc, auth cases, input) still needs a real server via `npm run tauri dev`.
 
 ---
 

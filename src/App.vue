@@ -1,9 +1,13 @@
 <script setup lang="ts">
-import { ref, onMounted, nextTick } from "vue";
+import { ref, onMounted, nextTick, watch } from "vue";
 import { invoke, Channel } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import Database from "@tauri-apps/plugin-sql";
 import { SCANCODES } from "./scancodes";
+import { keysymFor } from "./keysyms";
+
+// Default listening port per protocol (RDP 3389, VNC display :0 = 5900).
+const DEFAULT_PORTS: Record<string, number> = { rdp: 3389, vnc: 5900 };
 
 // Custom title-bar window controls (the OS frame is disabled).
 const appWindow = getCurrentWindow();
@@ -60,6 +64,18 @@ const draft = ref<Draft>(blankDraft());
 const editing = ref(false);
 const status = ref<string>("");
 const sidebarCollapsed = ref(false);
+
+// When the protocol changes in the form, snap the port to that protocol's
+// default — but only if the user hasn't typed a non-default port themselves.
+watch(
+  () => draft.value.protocol,
+  (proto, prev) => {
+    const def = DEFAULT_PORTS[proto];
+    if (def && draft.value.port === DEFAULT_PORTS[prev]) {
+      draft.value.port = def;
+    }
+  },
+);
 
 async function loadAll() {
   if (!db.value) return;
@@ -188,6 +204,7 @@ type Runtime = {
   lastX: number;
   lastY: number;
   connId: number; // which saved connection this session belongs to
+  protocol: string; // "rdp" | "vnc" — routes input/disconnect/resize commands
   lastThumb: number; // timestamp of the last thumbnail capture
 };
 const runtimes = new Map<number, Runtime>();
@@ -251,6 +268,18 @@ function handleFrame(id: number, data: ArrayBuffer | unknown) {
     }
     // Refresh the connection thumbnail at most every few seconds.
     if (Date.now() - rt.lastThumb > 4000) captureThumbnail(id);
+  } else if (tag === 3) {
+    // rect: [3][x u16][y u16][w u16][h u16][rgba...] — VNC dirty rectangle.
+    if (!rt.ctx) return;
+    const x = view.getUint16(1, true);
+    const y = view.getUint16(3, true);
+    const w = view.getUint16(5, true);
+    const h = view.getUint16(7, true);
+    const rgba = new Uint8ClampedArray(data.slice(9));
+    if (rgba.length === w * h * 4) {
+      rt.ctx.putImageData(new ImageData(rgba, w, h), x, y);
+    }
+    if (Date.now() - rt.lastThumb > 4000) captureThumbnail(id);
   } else if (tag === 2) {
     // status: [2][utf-8 message] — a disconnect/close/error notice.
     setStatus(id, new TextDecoder().decode(new Uint8Array(data, 1)));
@@ -272,7 +301,8 @@ function toRemoteCoords(id: number, e: MouseEvent): { x: number; y: number } | n
 }
 
 function sendInput(id: number, event: Record<string, unknown>) {
-  invoke("rdp_input", { sessionId: id, event }).catch(() => {});
+  const cmd = runtimes.get(id)?.protocol === "vnc" ? "vnc_input" : "rdp_input";
+  invoke(cmd, { sessionId: id, event }).catch(() => {});
 }
 
 function onMouseMove(id: number, e: MouseEvent) {
@@ -302,12 +332,21 @@ function onWheel(id: number, e: WheelEvent) {
 }
 
 // Keyboard is captured globally and routed to the active session tab only.
+// VNC speaks X11 keysyms; RDP speaks set-1 scancodes.
 function onKey(e: KeyboardEvent, pressed: boolean) {
   if (typeof activeTab.value !== "number") return;
-  const scancode = SCANCODES[e.code];
-  if (scancode === undefined) return;
-  e.preventDefault();
-  sendInput(activeTab.value, { kind: "key", scancode, pressed });
+  const id = activeTab.value;
+  if (runtimes.get(id)?.protocol === "vnc") {
+    const keysym = keysymFor(e);
+    if (keysym === undefined) return;
+    e.preventDefault();
+    sendInput(id, { kind: "key", keysym, pressed });
+  } else {
+    const scancode = SCANCODES[e.code];
+    if (scancode === undefined) return;
+    e.preventDefault();
+    sendInput(id, { kind: "key", scancode, pressed });
+  }
 }
 
 const keyDown = (e: KeyboardEvent) => onKey(e, true);
@@ -332,7 +371,10 @@ function onWindowResize() {
   // Debounce: only ask the server to resize once the drag settles.
   resizeTimer = window.setTimeout(() => {
     const { width, height } = currentSize();
-    invoke("rdp_resize", { sessionId: id, width, height }).catch(() => {});
+    // vnc_resize is best-effort (server-fixed size); rdp_resize drives the
+    // Display Control channel. Route to the active session's protocol.
+    const cmd = runtimes.get(id)?.protocol === "vnc" ? "vnc_resize" : "rdp_resize";
+    invoke(cmd, { sessionId: id, width, height }).catch(() => {});
   }, 250);
 }
 
@@ -340,7 +382,7 @@ async function connectBuiltin(c: Connection) {
   const id = nextSessionId++;
   runtimes.set(id, {
     canvas: null, ctx: null, width: 0, height: 0, lastX: -1, lastY: -1,
-    connId: c.id, lastThumb: 0,
+    connId: c.id, protocol: c.protocol, lastThumb: 0,
   });
   sessions.value.push({ id, name: c.name, status: `Connecting to ${c.name}...` });
   activeTab.value = id;
@@ -354,8 +396,9 @@ async function connectBuiltin(c: Connection) {
 
   runtimes.get(id)?.canvas?.focus();
 
+  const cmd = c.protocol === "vnc" ? "vnc_connect" : "rdp_connect";
   try {
-    await invoke("rdp_connect", {
+    await invoke(cmd, {
       sessionId: id,
       req: {
         id: c.id,
@@ -378,8 +421,9 @@ async function closeTab(id: number) {
   const idx = sessions.value.findIndex((s) => s.id === id);
   // Grab a final snapshot of the remote before tearing the session down.
   captureThumbnail(id);
+  const cmd = runtimes.get(id)?.protocol === "vnc" ? "vnc_disconnect" : "rdp_disconnect";
   try {
-    await invoke("rdp_disconnect", { sessionId: id });
+    await invoke(cmd, { sessionId: id });
   } catch {
     // ignore — session may already be gone
   }
@@ -514,6 +558,7 @@ onMounted(async () => {
           Protocol
           <select v-model="draft.protocol">
             <option value="rdp">RDP</option>
+            <option value="vnc">VNC</option>
           </select>
         </label>
         <div class="actions">
@@ -531,7 +576,7 @@ onMounted(async () => {
           @click="connectBuiltin(c)"
         >
           <div class="conn-card-actions">
-            <button class="icon-btn" title="Open with Windows RDP" @click.stop="connectMstsc(c)">🖥</button>
+            <button v-if="c.protocol === 'rdp'" class="icon-btn" title="Open with Windows RDP" @click.stop="connectMstsc(c)">🖥</button>
             <button class="icon-btn" title="Edit" @click.stop="editConn(c)">✎</button>
             <button class="icon-btn danger" title="Delete" @click.stop="deleteConn(c)">🗑</button>
           </div>

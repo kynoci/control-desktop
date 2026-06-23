@@ -29,6 +29,10 @@ log = "0.4"
 # Embedded, pure-Rust RDP client (no external mstsc/FreeRDP needed).
 ironrdp = { version = "0.15", features = ["connector", "session", "graphics", "input", "pdu", "svc", "dvc", "displaycontrol", "core"] }
 ironrdp-tokio = "0.9"
+# Embedded, pure-Rust VNC (RFB) client. ZRLE uses flate2/miniz_oxide (pure Rust);
+# keep flate2's default backend (do NOT enable its `zlib` feature) to preserve the
+# no-C-toolchain build. See plan-vnc.md §3.
+vnc-rs = "0.5"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "macros", "time"] }
 # Use the `ring` crypto backend (not aws-lc) to avoid a C/NASM toolchain at build time.
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
