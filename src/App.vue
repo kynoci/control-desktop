@@ -283,6 +283,83 @@ function handleFrame(id: number, data: ArrayBuffer | unknown) {
   } else if (tag === 2) {
     // status: [2][utf-8 message] — a disconnect/close/error notice.
     setStatus(id, new TextDecoder().decode(new Uint8Array(data, 1)));
+  } else if (tag === 3) {
+    // clipboard: [3][utf-8 text] — remote copied text; mirror to local clipboard.
+    const text = new TextDecoder().decode(new Uint8Array(data, 1));
+    navigator.clipboard.writeText(text).catch(() => {
+      /* clipboard write blocked (no permission / not focused) — ignore */
+    });
+  } else if (tag === 4) {
+    console.log(`[audio] tag 4 received, bytes=${data.byteLength}`);
+    // audio: [4][pcm] — remote sound, interleaved 16-bit PCM in the negotiated format.
+    playAudio(id, data);
+  } else if (tag === 5) {
+    // audio format: [5][rate u32][channels u8][bits u8] — sizes the player.
+    const rt = runtimes.get(id);
+    if (rt) {
+      rt.audioRate = view.getUint32(1, true);
+      rt.audioChannels = view.getUint8(5) || 2;
+      // Recreate the context at the new rate on the next chunk.
+      rt.audioCtx?.close().catch(() => {});
+      rt.audioCtx = null;
+      rt.audioNextTime = 0;
+      console.log(`[audio] format ${rt.audioRate}Hz ${rt.audioChannels}ch`);
+    }
+  }
+}
+
+// Play one PCM chunk, scheduled after the previous one so playback is gapless.
+function playAudio(id: number, data: ArrayBuffer) {
+  const rt = runtimes.get(id);
+  if (!rt) return;
+  const rate = rt.audioRate || 44100;
+  const channels = rt.audioChannels || 2;
+  if (!rt.audioCtx) {
+    rt.audioCtx = new AudioContext({ sampleRate: rate });
+    rt.audioNextTime = 0;
+  }
+  const ctx = rt.audioCtx;
+  // Browsers start the context suspended until a user gesture; nudge it.
+  if (ctx.state === "suspended") {
+    ctx.resume()
+      .then(() => console.log(`[audio] resumed, state=${ctx.state}`))
+      .catch((e) => console.warn("[audio] resume failed", e));
+  }
+
+  // Copy from byte offset 1 (skip the tag) into an aligned Int16 view.
+  const pcm = new Int16Array(data.slice(1));
+  const frames = Math.floor(pcm.length / channels);
+  if (frames === 0) return;
+
+  if (rt.audioNextTime === 0) {
+    console.log(`[audio] first chunk: ${pcm.length} samples, ctx.state=${ctx.state}`);
+  }
+
+  const buf = ctx.createBuffer(channels, frames, rate);
+  for (let ch = 0; ch < channels; ch++) {
+    const out = buf.getChannelData(ch);
+    for (let i = 0; i < frames; i++) out[i] = pcm[i * channels + ch] / 32768;
+  }
+
+  const node = ctx.createBufferSource();
+  node.buffer = buf;
+  node.connect(ctx.destination);
+  const now = ctx.currentTime;
+  // If we've fallen behind (underrun), restart the playhead from now.
+  if (rt.audioNextTime < now) rt.audioNextTime = now;
+  node.start(rt.audioNextTime);
+  rt.audioNextTime += buf.duration;
+}
+
+// Read the local OS clipboard and offer it to the remote session, so a paste
+// (Ctrl+V) inside the remote finds the same text. Best-effort: reading can fail
+// without focus/permission, in which case we just skip.
+async function offerLocalClipboard(id: number) {
+  try {
+    const text = await navigator.clipboard.readText();
+    if (text) await invoke("rdp_clipboard_offer", { sessionId: id, text });
+  } catch {
+    /* clipboard not readable — ignore */
   }
 }
 
@@ -377,13 +454,46 @@ function onWindowResize() {
     invoke(cmd, { sessionId: id, width, height }).catch(() => {});
   }, 250);
 }
+function unlockAudio(id: number) {
+  const rt = runtimes.get(id);
+  if (!rt) return;
 
+  if (!rt.audioCtx) {
+    rt.audioCtx = new AudioContext({ sampleRate: rt.audioRate || 44100 });
+    rt.audioNextTime = 0;
+  }
+
+  rt.audioCtx.resume().then(() => {
+    const ctx = rt.audioCtx;
+    console.log(`[audio] unlocked, state=${ctx?.state}`);
+
+    // Test local WebAudio output.
+    // If you hear this short beep, frontend/Tauri audio output is OK.
+    if (ctx) {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      gain.gain.value = 0.4; // loud and unmistakable
+      osc.frequency.value = 660;
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start();
+      osc.stop(ctx.currentTime + 1.2); // long so it can't be missed
+      console.log(`[audio] LOUD test beep playing for 1.2s, destination=${ctx.destination.maxChannelCount}ch`);
+    }
+  }).catch((e) => {
+    console.warn("[audio] unlock failed", e);
+  });
+}
 async function connectBuiltin(c: Connection) {
   const id = nextSessionId++;
+  
   runtimes.set(id, {
     canvas: null, ctx: null, width: 0, height: 0, lastX: -1, lastY: -1,
-    connId: c.id, protocol: c.protocol, lastThumb: 0,
+    connId: c.id, protocol: c.protocol, lastThumb: 0, audioCtx: null, audioNextTime: 0,
+    audioRate: 44100, audioChannels: 2,
   });
+  unlockAudio(id);
+  
   sessions.value.push({ id, name: c.name, status: `Connecting to ${c.name}...` });
   activeTab.value = id;
   await nextTick();
@@ -427,6 +537,7 @@ async function closeTab(id: number) {
   } catch {
     // ignore — session may already be gone
   }
+  runtimes.get(id)?.audioCtx?.close().catch(() => {});
   runtimes.delete(id);
   if (idx !== -1) sessions.value.splice(idx, 1);
   if (activeTab.value === id) {
@@ -448,6 +559,11 @@ onMounted(async () => {
   window.addEventListener("keydown", keyDown, true);
   window.addEventListener("keyup", keyUp, true);
   window.addEventListener("resize", onWindowResize);
+  // When the app regains focus (e.g. after copying in another app), prime the
+  // active session's remote clipboard with the local clipboard contents.
+  window.addEventListener("focus", () => {
+    if (typeof activeTab.value === "number") offerLocalClipboard(activeTab.value);
+  });
   // Keep the maximize/restore button in sync with the actual window state.
   refreshMaximized();
   appWindow.onResized(() => refreshMaximized());
@@ -623,6 +739,7 @@ onMounted(async () => {
           :ref="(el) => setCanvas(s.id, el as Element | null)"
           tabindex="0"
           class="screen"
+          @focus="() => offerLocalClipboard(s.id)"
           @mousemove="(e) => onMouseMove(s.id, e)"
           @mousedown="(e) => onMouseButton(s.id, e, true)"
           @mouseup="(e) => onMouseButton(s.id, e, false)"

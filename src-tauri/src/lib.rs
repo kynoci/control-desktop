@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use tauri_plugin_sql::{Migration, MigrationKind};
 
+mod clipboard;
 mod rdp;
 mod vnc;
 
@@ -158,6 +159,7 @@ pub fn run() {
             connect_rdp,
             rdp::rdp_connect,
             rdp::rdp_input,
+            rdp::rdp_clipboard_offer,
             rdp::rdp_resize,
             rdp::rdp_disconnect,
             vnc::vnc_connect,

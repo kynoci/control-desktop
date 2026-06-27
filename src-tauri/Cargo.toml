@@ -27,7 +27,7 @@ serde_json = "1"
 log = "0.4"
 
 # Embedded, pure-Rust RDP client (no external mstsc/FreeRDP needed).
-ironrdp = { version = "0.15", features = ["connector", "session", "graphics", "input", "pdu", "svc", "dvc", "displaycontrol", "core"] }
+ironrdp = { version = "0.15", features = ["connector", "session", "graphics", "input", "pdu", "svc", "dvc", "displaycontrol", "cliprdr", "core"] }
 ironrdp-tokio = "0.9"
 # Embedded, pure-Rust VNC (RFB) client. ZRLE uses flate2/miniz_oxide (pure Rust);
 # keep flate2's default backend (do NOT enable its `zlib` feature) to preserve the

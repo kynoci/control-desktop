@@ -23,6 +23,8 @@ use ironrdp::connector::{
 };
 use ironrdp::connector::sspi::generator::NetworkRequest;
 use ironrdp::core::WriteBuf;
+use ironrdp::cliprdr::backend::ClipboardMessage;
+use ironrdp::cliprdr::{Cliprdr, CliprdrClient};
 use ironrdp::displaycontrol::client::DisplayControlClient;
 use ironrdp::dvc::DrdynvcClient;
 use ironrdp::graphics::image_processing::PixelFormat;
@@ -32,6 +34,7 @@ use ironrdp::session::image::DecodedImage;
 use ironrdp::session::{fast_path, ActiveStage, ActiveStageOutput};
 use ironrdp_tokio::{single_sequence_step_read, FramedWrite as _, TokioFramed};
 
+use crate::clipboard::{advertise_text, LocalClipboard, WebClipboardBackend};
 use crate::ConnectRequest;
 
 // --- Channel wire format (raw bytes, little-endian) ----------------------------
@@ -41,6 +44,8 @@ use crate::ConnectRequest;
 const TAG_INIT: u8 = 0;
 const TAG_STRIP: u8 = 1;
 const TAG_STATUS: u8 = 2;
+// tag 3 = clipboard: [3][utf-8 text] -> remote clipboard text for the webview
+pub(crate) const TAG_CLIPBOARD: u8 = 3;
 
 fn status_msg(text: &str) -> InvokeResponseBody {
     let mut v = Vec::with_capacity(1 + text.len());
@@ -59,6 +64,10 @@ pub struct RdpState {
 struct SessionHandle {
     input_tx: mpsc::UnboundedSender<Vec<Operation>>,
     resize_tx: mpsc::UnboundedSender<(u16, u16)>,
+    /// Text the webview offers for the remote to paste; read by the clipboard backend.
+    clip_local: LocalClipboard,
+    /// Outbound clipboard messages drained by the session loop.
+    clip_tx: mpsc::UnboundedSender<ClipboardMessage>,
     cancel: CancellationToken,
 }
 
@@ -136,6 +145,8 @@ pub async fn rdp_connect(
     let cancel = CancellationToken::new();
     let (input_tx, input_rx) = mpsc::unbounded_channel::<Vec<Operation>>();
     let (resize_tx, resize_rx) = mpsc::unbounded_channel::<(u16, u16)>();
+    let (clip_tx, clip_rx) = mpsc::unbounded_channel::<ClipboardMessage>();
+    let clip_local: LocalClipboard = Arc::new(Mutex::new(None));
     {
         let mut guard = state.sessions.lock().unwrap();
         if let Some(old) = guard.insert(
@@ -143,6 +154,8 @@ pub async fn rdp_connect(
             SessionHandle {
                 input_tx,
                 resize_tx,
+                clip_local: clip_local.clone(),
+                clip_tx: clip_tx.clone(),
                 cancel: cancel.clone(),
             },
         ) {
@@ -152,7 +165,10 @@ pub async fn rdp_connect(
 
     tauri::async_runtime::spawn(async move {
         let frame = on_frame.clone();
-        let outcome = run_session(req, password, width, height, on_frame, input_rx, resize_rx, cancel).await;
+        let outcome = run_session(
+            req, password, width, height, on_frame, input_rx, resize_rx, clip_local, clip_tx, clip_rx, cancel,
+        )
+        .await;
         // Remove ourselves from the registry once the task is over.
         if let Some(state) = app.try_state::<RdpState>() {
             state.sessions.lock().unwrap().remove(&session_id);
@@ -177,6 +193,18 @@ pub fn rdp_input(session_id: u32, event: RdpInputEvent, state: State<'_, RdpStat
     if let Some(session) = guard.get(&session_id) {
         // If the receiver is gone the session already ended; ignore the error.
         let _ = session.input_tx.send(to_operations(event));
+    }
+    Ok(())
+}
+
+/// The webview's local clipboard text changed; store it and advertise it to the
+/// remote so it can be pasted there.
+#[tauri::command]
+pub fn rdp_clipboard_offer(session_id: u32, text: String, state: State<'_, RdpState>) -> Result<(), String> {
+    let guard = state.sessions.lock().unwrap();
+    if let Some(session) = guard.get(&session_id) {
+        *session.clip_local.lock().unwrap() = Some(text);
+        let _ = session.clip_tx.send(advertise_text());
     }
     Ok(())
 }
@@ -213,6 +241,9 @@ async fn run_session(
     on_frame: Channel<InvokeResponseBody>,
     mut input_rx: mpsc::UnboundedReceiver<Vec<Operation>>,
     mut resize_rx: mpsc::UnboundedReceiver<(u16, u16)>,
+    clip_local: LocalClipboard,
+    clip_tx: mpsc::UnboundedSender<ClipboardMessage>,
+    mut clip_rx: mpsc::UnboundedReceiver<ClipboardMessage>,
     cancel: CancellationToken,
 ) -> Result<(), String> {
     // Some servers — notably GNOME Remote Desktop in "Remote Login" mode — drop
@@ -227,7 +258,8 @@ async fn run_session(
             if cancel.is_cancelled() {
                 return Ok(());
             }
-            match establish(&req, &password, width, height).await {
+            let clip_backend = WebClipboardBackend::new(clip_local.clone(), clip_tx.clone(), on_frame.clone());
+            match establish(&req, &password, width, height, clip_backend).await {
                 Ok(pair) => {
                     established = Some(pair);
                     break;
@@ -296,6 +328,22 @@ async fn run_session(
                 active_stage
                     .process_fastpath_input(&mut image, &events)
                     .map_err(|e| format!("input encode failed: {e}"))?
+            }
+            maybe = clip_rx.recv() => {
+                // Clipboard PDUs to send (advertise/paste/data). The receiver only
+                // closes when the session is torn down, so `None` ends the loop.
+                let Some(msg) = maybe else { break 'session };
+                match dispatch_clipboard(&mut active_stage, msg) {
+                    Ok(bytes) if !bytes.is_empty() => {
+                        writer
+                            .write_all(&bytes)
+                            .await
+                            .map_err(|e| format!("clipboard write failed: {e}"))?;
+                    }
+                    Ok(_) => {}
+                    Err(e) => log::warn!("clipboard dispatch failed: {e}"),
+                }
+                Vec::new()
             }
             res = reader.read_pdu() => {
                 let (action, payload) = match res {
@@ -422,6 +470,32 @@ where
     }
 }
 
+/// Turn a queued [`ClipboardMessage`] into the wire bytes to send on the CLIPRDR
+/// channel. Looks up the live `Cliprdr` processor in the active stage, invokes the
+/// matching method, and encodes the resulting SVC messages.
+fn dispatch_clipboard(stage: &mut ActiveStage, msg: ClipboardMessage) -> Result<Vec<u8>, String> {
+    let cliprdr = stage
+        .get_svc_processor_mut::<CliprdrClient>()
+        .ok_or_else(|| "cliprdr channel not available".to_string())?;
+    let svc_messages = match msg {
+        ClipboardMessage::SendInitiateCopy(formats) => cliprdr.initiate_copy(&formats),
+        ClipboardMessage::SendInitiatePaste(format_id) => cliprdr.initiate_paste(format_id),
+        ClipboardMessage::SendFormatData(response) => cliprdr.submit_format_data(response),
+        // File transfer is unsupported (we advertise empty capabilities).
+        ClipboardMessage::SendFileContentsRequest(_) | ClipboardMessage::SendFileContentsResponse(_) => {
+            return Ok(Vec::new());
+        }
+        ClipboardMessage::Error(e) => {
+            log::warn!("clipboard backend error: {e}");
+            return Ok(Vec::new());
+        }
+    }
+    .map_err(|e| format!("clipboard encode failed: {e}"))?;
+    stage
+        .process_svc_processor_messages(svc_messages)
+        .map_err(|e| format!("clipboard svc encode failed: {e}"))
+}
+
 /// One full connect attempt: TCP → RDP negotiation → TLS → CredSSP/NLA. Returns
 /// the upgraded framed stream plus the negotiated connection result, ready for
 /// the active session. Kept separate from `run_session` so it can be retried.
@@ -430,6 +504,7 @@ async fn establish(
     password: &str,
     width: u16,
     height: u16,
+    clipboard_backend: Box<dyn ironrdp::cliprdr::backend::CliprdrBackend>,
 ) -> Result<
     (
         TokioFramed<tokio_rustls::client::TlsStream<TcpStream>>,
@@ -446,10 +521,13 @@ async fn establish(
     let client_addr = tcp.local_addr().map_err(|e| e.to_string())?;
 
     let mut framed: TokioFramed<TcpStream> = TokioFramed::new(tcp);
-    // Register the Display Control dynamic channel so the server accepts later
-    // resize requests (DISPLAYCONTROL_MONITOR_LAYOUT).
-    let drdynvc = DrdynvcClient::new().with_dynamic_channel(DisplayControlClient::new(|_| Ok(Vec::new())));
-    let mut connector = ClientConnector::new(config, client_addr).with_static_channel(drdynvc);
+    // Dynamic channel: Display Control (for resize). Static channel: clipboard.
+    let drdynvc = DrdynvcClient::new()
+        .with_dynamic_channel(DisplayControlClient::new(|_| Ok(Vec::new())));
+    let cliprdr: CliprdrClient = Cliprdr::new(clipboard_backend);
+    let mut connector = ClientConnector::new(config, client_addr)
+        .with_static_channel(drdynvc)
+        .with_static_channel(cliprdr);
 
     let should_upgrade = ironrdp_tokio::connect_begin(&mut framed, &mut connector)
         .await
