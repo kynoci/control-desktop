@@ -12,8 +12,17 @@ const DEFAULT_PORTS: Record<string, number> = { rdp: 3389, vnc: 5900 };
 // Custom title-bar window controls (the OS frame is disabled).
 const appWindow = getCurrentWindow();
 const isMaximized = ref(false);
+const isFullscreen = ref(false);
 async function refreshMaximized() {
   isMaximized.value = await appWindow.isMaximized();
+}
+// Drive the OS window in/out of true fullscreen. Hiding the title bar (via the
+// `fullscreen` class on .root) lets the active session fill the whole screen;
+// the resize event then reflows the canvas and resizes the remote desktop.
+async function toggleFullscreen() {
+  const next = !(await appWindow.isFullscreen());
+  await appWindow.setFullscreen(next);
+  isFullscreen.value = next;
 }
 function winMinimize() {
   appWindow.minimize();
@@ -434,9 +443,11 @@ const keyUp = (e: KeyboardEvent) => onKey(e, false);
 function currentSize(): { width: number; height: number } {
   const even = (n: number) => Math.floor(n / 2) * 2;
   const clamp = (n: number) => Math.max(200, Math.min(8192, n));
+  // In fullscreen the title bar is hidden, so the session owns the full height.
+  const chrome = isFullscreen.value ? 0 : 38; // tab bar height (controls overlay)
   return {
     width: clamp(even(window.innerWidth)),
-    height: clamp(even(window.innerHeight - 38)), // minus the tab bar (toolbar overlays)
+    height: clamp(even(window.innerHeight - chrome)),
   };
 }
 
@@ -566,7 +577,10 @@ onMounted(async () => {
   });
   // Keep the maximize/restore button in sync with the actual window state.
   refreshMaximized();
-  appWindow.onResized(() => refreshMaximized());
+  appWindow.onResized(async () => {
+    refreshMaximized();
+    isFullscreen.value = await appWindow.isFullscreen();
+  });
   try {
     db.value = await Database.load("sqlite:remote.db");
     await loadAll();
@@ -577,7 +591,7 @@ onMounted(async () => {
 </script>
 
 <template>
-  <div class="root">
+  <div class="root" :class="{ fullscreen: isFullscreen }">
     <div class="titlebar" data-tauri-drag-region>
       <div class="brand" data-tauri-drag-region>
         <img src="/app-icon.png" class="brand-icon" alt="" data-tauri-drag-region />
@@ -691,6 +705,7 @@ onMounted(async () => {
           :title="`Connect to ${c.name}`"
           @click="connectBuiltin(c)"
         >
+          <span class="conn-card-proto" :class="c.protocol">{{ c.protocol.toUpperCase() }}</span>
           <div class="conn-card-actions">
             <button v-if="c.protocol === 'rdp'" class="icon-btn" title="Open with Windows RDP" @click.stop="connectMstsc(c)">🖥</button>
             <button class="icon-btn" title="Edit" @click.stop="editConn(c)">✎</button>
@@ -703,7 +718,6 @@ onMounted(async () => {
           <div class="conn-card-info">
             <div class="conn-card-name">{{ c.name }}</div>
             <div class="conn-card-host">{{ c.username }}@{{ c.host }}:{{ c.port }}</div>
-            <span class="conn-card-proto">{{ c.protocol.toUpperCase() }}</span>
           </div>
         </div>
 
@@ -729,6 +743,13 @@ onMounted(async () => {
         <div class="session-hint">⌄</div>
         <div class="session-controls">
           <span v-if="s.status" class="session-status-mini">{{ s.status }}</span>
+          <button
+            class="session-fullscreen"
+            :title="isFullscreen ? 'Exit fullscreen' : 'Fullscreen'"
+            @click="toggleFullscreen"
+          >
+            {{ isFullscreen ? "🗗 Exit fullscreen" : "⛶ Fullscreen" }}
+          </button>
           <button class="session-disconnect" title="Disconnect" @click="closeTab(s.id)">
             ⏻ Disconnect
           </button>
@@ -776,6 +797,8 @@ body, html, #app { margin: 0; height: 100%; }
   position: relative;
   z-index: 100;
 }
+/* Fullscreen: hide the title bar so the active session owns the whole screen. */
+.root.fullscreen .titlebar { display: none; }
 /* App icon + title on the far left of the title bar. */
 .brand {
   display: flex;
@@ -795,7 +818,9 @@ body, html, #app { margin: 0; height: 100%; }
 
 .tabs {
   display: flex;
-  align-items: stretch;
+  align-items: center;
+  gap: 5px;
+  padding: 0 6px;
   flex: 0 1 auto;
   min-width: 0;
   /* Scroll horizontally only; never show a vertical scrollbar. */
@@ -829,19 +854,23 @@ body, html, #app { margin: 0; height: 100%; }
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 0 14px;
-  height: 38px;
-  border: none;
-  border-right: 1px solid #2a2a2e;
-  border-radius: 0;
-  background: transparent;
+  flex: 0 0 auto;
+  padding: 0 12px;
+  height: 28px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.05);
   color: #c5c5cb;
   font-size: 13px;
   white-space: nowrap;
   cursor: pointer;
 }
-.tab:hover { background: #27272a; }
-.tab.active { background: #f5f5f7; color: #1a1a1a; }
+.tab:hover { background: rgba(255, 255, 255, 0.11); }
+.tab.active {
+  background: #f5f5f7;
+  color: #1a1a1a;
+  border-color: #f5f5f7;
+}
 .tab-name { max-width: 180px; overflow: hidden; text-overflow: ellipsis; }
 .tab-close {
   display: inline-flex;
@@ -980,20 +1009,39 @@ body, html, #app { margin: 0; height: 100%; }
 }
 .conn-card-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
 .conn-card-thumb-empty { font-size: 30px; opacity: 0.35; }
-.conn-card-info { padding: 11px 13px; }
-.conn-card-name { font-weight: 600; font-size: 15px; }
-.conn-card-host { font-size: 12px; color: #666; margin-top: 3px; word-break: break-all; }
+.conn-card-info {
+  padding: 11px 13px;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+.conn-card-name { font-weight: 600; font-size: 15px; flex: 0 0 auto; }
+.conn-card-host {
+  font-size: 12px;
+  color: #666;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* Protocol badge pinned to the top-right corner, over the thumbnail. */
 .conn-card-proto {
-  display: inline-block;
-  margin-top: 10px;
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 1;
   font-size: 10px;
   font-weight: 700;
   letter-spacing: 0.04em;
-  color: #3b5bdb;
-  background: #eaf0ff;
+  color: #fff;
+  background: rgba(59, 91, 219, 0.92);
   border-radius: 4px;
   padding: 2px 6px;
+  transition: opacity 0.12s ease;
 }
+.conn-card-proto.vnc { background: rgba(13, 148, 136, 0.92); }
+/* Hover reveals the action buttons in the same corner; hide the badge then. */
+.conn-card:hover .conn-card-proto { opacity: 0; }
 .conn-card-actions {
   position: absolute;
   top: 8px;
@@ -1175,6 +1223,16 @@ button.danger:hover { background: #fef2f2; }
   cursor: pointer;
 }
 .session-disconnect:hover { background: rgb(220, 40, 40); }
+.session-fullscreen {
+  border: none;
+  border-radius: 6px;
+  padding: 5px 11px;
+  font-size: 12px;
+  color: #fff;
+  background: rgba(60, 60, 66, 0.9);
+  cursor: pointer;
+}
+.session-fullscreen:hover { background: rgba(80, 80, 88, 0.95); }
 .session-canvas-wrap {
   position: absolute;
   inset: 0;
@@ -1209,7 +1267,7 @@ button.danger:hover { background: #fef2f2; }
   .conn-card { background: #1f1f23; border-color: #2f2f35; }
   .conn-card:hover { border-color: #3b5bdb; box-shadow: 0 2px 12px rgba(0, 0, 0, 0.5); }
   .conn-card-host { color: #a1a1aa; }
-  .conn-card-proto { color: #9db4ff; background: #1e2a55; }
+  /* Keep the solid colored badge in dark mode (white text reads on both). */
   .conn-card-actions .icon-btn { background: rgba(31, 31, 35, 0.85); }
   .conn-card.add { color: #a1a1aa; }
   .conn-card.add:hover { color: #93b0ff; border-color: #3b5bdb; background: #20232e; }
