@@ -215,6 +215,10 @@ type Runtime = {
   connId: number; // which saved connection this session belongs to
   protocol: string; // "rdp" | "vnc" — routes input/disconnect/resize commands
   lastThumb: number; // timestamp of the last thumbnail capture
+  audioCtx: AudioContext | null;
+  audioNextTime: number;
+  audioRate: number;
+  audioChannels: number;
 };
 const runtimes = new Map<number, Runtime>();
 
