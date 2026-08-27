@@ -31,21 +31,31 @@ use ironrdp::graphics::image_processing::PixelFormat;
 use ironrdp::input::{Database, MouseButton, MousePosition, Operation, Scancode, WheelRotations};
 use ironrdp::pdu::geometry::InclusiveRectangle;
 use ironrdp::session::image::DecodedImage;
-use ironrdp::session::{fast_path, ActiveStage, ActiveStageOutput};
+use ironrdp::session::{fast_path, ActiveStage, ActiveStageBuilder, ActiveStageOutput};
+use ironrdp_bulk::BulkCompressor;
+use ironrdp_egfx::client::GraphicsPipelineClient;
 use ironrdp_tokio::{single_sequence_step_read, FramedWrite as _, TokioFramed};
 
 use crate::clipboard::{advertise_text, LocalClipboard, WebClipboardBackend};
+use crate::egfx::EgfxHandler;
 use crate::ConnectRequest;
 
 // --- Channel wire format (raw bytes, little-endian) ----------------------------
 // tag 0 = init:  [0][width u16][height u16]      -> frontend sizes the canvas
 // tag 1 = strip: [1][y u16][height u16][rgba..]  -> full-width RGBA strip at row y
 // tag 2 = status:[2][utf-8 message]              -> human-readable status / error
-const TAG_INIT: u8 = 0;
+// tag 3 = rect:  [3][x][y][w][h][rgba..]         -> arbitrary dirty rect (EGFX)
+pub(crate) const TAG_INIT: u8 = 0;
 const TAG_STRIP: u8 = 1;
 const TAG_STATUS: u8 = 2;
-// tag 3 = clipboard: [3][utf-8 text] -> remote clipboard text for the webview
-pub(crate) const TAG_CLIPBOARD: u8 = 3;
+// tag 3 = rect: [3][x u16][y u16][w u16][h u16][rgba..] -> arbitrary dirty rect.
+// Used by the Graphics Pipeline (EGFX) path, whose updates aren't full-width
+// strips. Same format `vnc.rs` sends for RFB rectangles.
+const TAG_RECT: u8 = 3;
+// tag 7 = clipboard: [7][utf-8 text] -> remote clipboard text for the webview.
+// NOTE: this was tag 3 until EGFX landed, which collided with the rect tag above
+// and meant `handleFrame` in App.vue never reached the clipboard branch.
+pub(crate) const TAG_CLIPBOARD: u8 = 7;
 // tag 6 = ended: [6][utf-8 message] -> the session is over (error or clean close).
 // Kept distinct from tag 2 so the UI can tell "still working on it" apart from
 // "it stopped", instead of guessing from the wording.
@@ -276,6 +286,9 @@ async fn run_session(
                     established = Some(pair);
                     break;
                 }
+                // Retry only while attempts remain. The final attempt falls through
+                // to the arm below so `established` stays `None` and the caller gets
+                // the explanatory message rather than the raw IronRDP error.
                 Err(e) if is_handoff_disconnect(&e) && attempt < MAX_ATTEMPTS => {
                     log::warn!("connect attempt {attempt}/{MAX_ATTEMPTS} hit handoff disconnect; reconnecting: {e}");
                     let _ = on_frame.send(status_msg(&format!(
@@ -283,6 +296,9 @@ async fn run_session(
                     )));
                     last_err = e;
                     tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                }
+                Err(e) if is_handoff_disconnect(&e) => {
+                    last_err = e;
                 }
                 Err(e) => return Err(e),
             }
@@ -292,18 +308,39 @@ async fn run_session(
             None => {
                 return Err(format!(
                     "server kept dropping the session after {MAX_ATTEMPTS} reconnect attempts (last: {last_err}). \
-                     This GNOME Remote Login handover needs RDP Server Redirection, which IronRDP does not support yet — \
-                     use the Windows RDP button, or switch the host to GNOME 'Desktop Sharing'."
+                     If the host is GNOME/Ubuntu, check `journalctl --user -u gnome-remote-desktop -f` on it while \
+                     connecting — it names the reason. Otherwise use the Windows RDP button for this host."
                 ));
             }
         }
     };
 
-    let desktop = connection_result.desktop_size;
+    let ConnectionResult {
+        io_channel_id,
+        user_channel_id,
+        message_channel_id,
+        share_id,
+        static_channels,
+        desktop_size: desktop,
+        enable_server_pointer,
+        pointer_software_rendering,
+        activation_factory,
+        compression_type,
+    } = connection_result;
     log::info!("rdp_connect: negotiated desktop {}x{}", desktop.width, desktop.height);
 
     let mut image = DecodedImage::new(PixelFormat::RgbA32, desktop.width, desktop.height);
-    let mut active_stage = ActiveStage::new(connection_result);
+    let mut active_stage = ActiveStageBuilder {
+        static_channels,
+        user_channel_id,
+        io_channel_id,
+        message_channel_id,
+        share_id,
+        compression_type,
+        enable_server_pointer,
+        pointer_software_rendering,
+    }
+    .build();
     let mut db = Database::new();
 
     // Split so we can read PDUs and write input/response frames concurrently.
@@ -383,12 +420,23 @@ async fn run_session(
                     log::info!("rdp session terminated: {reason}");
                     break 'session;
                 }
-                ActiveStageOutput::DeactivateAll(mut cas) => {
+                ActiveStageOutput::DeactivateAll => {
                     // Server-initiated Deactivation-Reactivation (e.g. after a resize).
-                    // Drive the activation sequence to completion, then rebuild the
+                    // Drive a fresh activation sequence to completion, then rebuild the
                     // framebuffer and processors at the new desktop size.
-                    reactivate(&mut reader, &mut writer, cas.as_mut(), &mut image, &mut active_stage, &on_frame)
-                        .await?;
+                    let mut cas = activation_factory.create();
+                    reactivate(
+                        &mut reader,
+                        &mut writer,
+                        &mut cas,
+                        io_channel_id,
+                        user_channel_id,
+                        compression_type,
+                        &mut image,
+                        &mut active_stage,
+                        &on_frame,
+                    )
+                    .await?;
                 }
                 // Pointer updates: we rely on the local OS cursor over the canvas,
                 // so the remote pointer sprite is intentionally ignored for now.
@@ -427,6 +475,9 @@ async fn reactivate<R, W>(
     reader: &mut TokioFramed<R>,
     writer: &mut TokioFramed<W>,
     cas: &mut ironrdp::connector::connection_activation::ConnectionActivationSequence,
+    io_channel_id: u16,
+    user_channel_id: u16,
+    compression_type: Option<ironrdp::pdu::rdp::client_info::CompressionType>,
     image: &mut DecodedImage,
     active_stage: &mut ActiveStage,
     on_frame: &Channel<InvokeResponseBody>,
@@ -448,8 +499,6 @@ where
                 .map_err(|e| format!("reactivation write failed: {e}"))?;
         }
         if let ConnectionActivationState::Finalized {
-            io_channel_id,
-            user_channel_id,
             desktop_size,
             share_id,
             enable_server_pointer,
@@ -457,6 +506,10 @@ where
         } = cas.connection_activation_state()
         {
             *image = DecodedImage::new(PixelFormat::RgbA32, desktop_size.width, desktop_size.height);
+            // Rebuilding the fast-path processor drops its bulk decompressor, so
+            // recreate one when compression was negotiated — otherwise every
+            // compressed server PDU after a reactivation would fail to decode.
+            let bulk_decompressor = compression_type.and_then(|ct| BulkCompressor::new(to_bulk_compression_type(ct)).ok());
             active_stage.set_fastpath_processor(
                 fast_path::ProcessorBuilder {
                     io_channel_id,
@@ -464,7 +517,7 @@ where
                     share_id,
                     enable_server_pointer,
                     pointer_software_rendering,
-                    bulk_decompressor: None,
+                    bulk_decompressor,
                 }
                 .build(),
             );
@@ -494,7 +547,9 @@ fn dispatch_clipboard(stage: &mut ActiveStage, msg: ClipboardMessage) -> Result<
         ClipboardMessage::SendInitiatePaste(format_id) => cliprdr.initiate_paste(format_id),
         ClipboardMessage::SendFormatData(response) => cliprdr.submit_format_data(response),
         // File transfer is unsupported (we advertise empty capabilities).
-        ClipboardMessage::SendFileContentsRequest(_) | ClipboardMessage::SendFileContentsResponse(_) => {
+        ClipboardMessage::SendFileContentsRequest(_)
+        | ClipboardMessage::SendFileContentsResponse(_)
+        | ClipboardMessage::SendInitiateFileCopy(_) => {
             return Ok(Vec::new());
         }
         ClipboardMessage::Error(e) => {
@@ -537,9 +592,17 @@ async fn establish(
     let client_addr = tcp.local_addr().map_err(|e| e.to_string())?;
 
     let mut framed: TokioFramed<TcpStream> = TokioFramed::new(tcp);
-    // Dynamic channel: Display Control (for resize). Static channel: clipboard.
+    // Dynamic channels: Display Control (resize) and the Graphics Pipeline (EGFX).
+    // Static channel: clipboard. EGFX is mandatory for servers with no legacy
+    // bitmap path — notably gnome-remote-desktop; see plan-egfx.md. `None` here is
+    // the H.264 decoder: we don't ship one, so the crate negotiates a non-AVC
+    // capability set and the server falls back to RemoteFX/uncompressed.
     let drdynvc = DrdynvcClient::new()
-        .with_dynamic_channel(DisplayControlClient::new(|_| Ok(Vec::new())));
+        .with_dynamic_channel(DisplayControlClient::new(|_| Ok(Vec::new())))
+        .with_dynamic_channel(GraphicsPipelineClient::new(
+            Box::new(EgfxHandler::new(on_frame.clone())),
+            None,
+        ));
     let cliprdr: CliprdrClient = Cliprdr::new(clipboard_backend);
     let mut connector = ClientConnector::new(config, client_addr)
         .with_static_channel(drdynvc)
@@ -581,10 +644,43 @@ async fn establish(
     Ok((upgraded_framed, connection_result))
 }
 
+/// Map the PDU-layer compression type onto the bulk crate's. Mirrors the private
+/// helper of the same name in `ironrdp-session`, needed because `reactivate()`
+/// rebuilds the fast-path processor by hand.
+fn to_bulk_compression_type(ct: ironrdp::pdu::rdp::client_info::CompressionType) -> ironrdp_bulk::CompressionType {
+    use ironrdp::pdu::rdp::client_info::CompressionType as Pdu;
+    match ct {
+        Pdu::K8 => ironrdp_bulk::CompressionType::Rdp4,
+        Pdu::K64 => ironrdp_bulk::CompressionType::Rdp5,
+        Pdu::Rdp6 => ironrdp_bulk::CompressionType::Rdp6,
+        Pdu::Rdp61 => ironrdp_bulk::CompressionType::Rdp61,
+    }
+}
+
 /// True when an error is the post-auth "session handover" disconnect some servers
 /// (e.g. GNOME Remote Login) issue, expecting the client to reconnect.
 fn is_handoff_disconnect(err: &str) -> bool {
     err.contains("disconnect provider ultimatum") || err.contains("UserRequested")
+}
+
+/// Send an arbitrary RGBA dirty rectangle (tag 3). Used by the EGFX path, whose
+/// updates are surface rectangles rather than full-width strips.
+pub(crate) fn send_rect(
+    on_frame: &Channel<InvokeResponseBody>,
+    x: u16,
+    y: u16,
+    w: u16,
+    h: u16,
+    rgba: &[u8],
+) -> Result<(), String> {
+    let mut msg = Vec::with_capacity(9 + rgba.len());
+    msg.push(TAG_RECT);
+    msg.extend_from_slice(&x.to_le_bytes());
+    msg.extend_from_slice(&y.to_le_bytes());
+    msg.extend_from_slice(&w.to_le_bytes());
+    msg.extend_from_slice(&h.to_le_bytes());
+    msg.extend_from_slice(rgba);
+    on_frame.send(InvokeResponseBody::Raw(msg)).map_err(|e| e.to_string())
 }
 
 /// Send the changed rows as a full-width RGBA strip. We widen every dirty

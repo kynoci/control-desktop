@@ -27,8 +27,15 @@ serde_json = "1"
 log = "0.4"
 
 # Embedded, pure-Rust RDP client (no external mstsc/FreeRDP needed).
-ironrdp = { version = "0.15", features = ["connector", "session", "graphics", "input", "pdu", "svc", "dvc", "displaycontrol", "cliprdr", "core"] }
-ironrdp-tokio = "0.9"
+ironrdp = { version = "0.17", features = ["connector", "session", "graphics", "input", "pdu", "svc", "dvc", "displaycontrol", "cliprdr", "core"] }
+ironrdp-tokio = "0.10"
+# Graphics Pipeline (EGFX, MS-RDPEGFX). Required by GNOME Remote Desktop, which has
+# no legacy bitmap output path — see plan-egfx.md. Default features only: H.264 sits
+# behind the optional `openh264*` features and would need a C toolchain.
+ironrdp-egfx = { version = "0.3", default-features = false }
+# Bulk decompressor. Needed to rebuild the fast-path processor after a server
+# Deactivate-All when RDP bulk compression was negotiated — see `reactivate()`.
+ironrdp-bulk = "0.1"
 # Embedded, pure-Rust VNC (RFB) client. ZRLE uses flate2/miniz_oxide (pure Rust);
 # keep flate2's default backend (do NOT enable its `zlib` feature) to preserve the
 # no-C-toolchain build. See plan-vnc.md §3.
@@ -49,10 +56,18 @@ keyring = { version = "3", features = ["apple-native"] }
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { version = "3", features = ["sync-secret-service"] }
 
-# Vendored copy of ironrdp-connector 0.9.0 with a one-line fix: tolerate a
-# Server Deactivate All PDU during Capabilities Exchange (Deactivation-Reactivation
-# Sequence). Upstream 0.9.0 aborts with "invalid state (this is a bug)" — see
-# vendor/ironrdp-connector/src/connection.rs. Remove once fixed upstream.
+# Vendored copy of ironrdp-connector 0.10.0 with a one-line fix: also advertise
+# ClientEarlyCapabilityFlags::SUPPORT_DYN_VC_GFX_PROTOCOL, so servers that only
+# emit over the Graphics Pipeline (notably gnome-remote-desktop) will hand us a
+# desktop instead of closing the connection at Capabilities Exchange. Upstream
+# hardcodes the flag list with no opt-in — see plan-egfx.md.
+#
+# The previous patch here (tolerate a Server Deactivate All PDU during Capabilities
+# Exchange) landed upstream in 0.10 and is no longer carried locally.
+# Vendored copy of ironrdp-graphics 0.9.0 with a one-function fix: the RemoteFX
+# Progressive tile reconstruction used the wrong YCbCr scale, saturating every
+# real server frame (mid-tones to black, highlights to red). See plan-egfx.md.
 [patch.crates-io]
 ironrdp-connector = { path = "vendor/ironrdp-connector" }
+ironrdp-graphics = { path = "vendor/ironrdp-graphics" }
 

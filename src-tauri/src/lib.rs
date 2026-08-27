@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use tauri_plugin_sql::{Migration, MigrationKind};
 
 mod clipboard;
+mod egfx;
 mod rdp;
 mod vnc;
 

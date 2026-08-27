@@ -828,7 +828,9 @@ function handleFrame(id: number, data: ArrayBuffer | unknown) {
     // Refresh the connection thumbnail at most every few seconds.
     if (Date.now() - rt.lastThumb > 4000) captureThumbnail(id);
   } else if (tag === 3) {
-    // rect: [3][x u16][y u16][w u16][h u16][rgba...] — VNC dirty rectangle.
+    // rect: [3][x u16][y u16][w u16][h u16][rgba...] — an arbitrary dirty
+    // rectangle: a VNC/RFB update, or an RDP Graphics Pipeline (EGFX) surface
+    // update. Neither arrives as a full-width strip the way legacy RDP does.
     if (!rt.ctx) return;
     const x = view.getUint16(1, true);
     const y = view.getUint16(3, true);
@@ -842,8 +844,10 @@ function handleFrame(id: number, data: ArrayBuffer | unknown) {
   } else if (tag === 2) {
     // status: [2][utf-8 message] — a disconnect/close/error notice.
     setStatus(id, new TextDecoder().decode(new Uint8Array(data, 1)));
-  } else if (tag === 3) {
-    // clipboard: [3][utf-8 text] — remote copied text; mirror to local clipboard.
+  } else if (tag === 7) {
+    // clipboard: [7][utf-8 text] — remote copied text; mirror to local clipboard.
+    // Was tag 3 until EGFX landed, which collided with the rect tag above — the
+    // rect branch matched first, so this branch was unreachable.
     const text = new TextDecoder().decode(new Uint8Array(data, 1));
     navigator.clipboard.writeText(text).catch(() => {
       /* clipboard write blocked (no permission / not focused) — ignore */
