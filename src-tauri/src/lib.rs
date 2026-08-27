@@ -113,10 +113,11 @@ fn launch_mstsc(_host: &str, _port: u16, _username: &str, _password: &str) -> Re
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let migrations = vec![Migration {
-        version: 1,
-        description: "create_connections_table",
-        sql: "CREATE TABLE IF NOT EXISTS connections (
+    let migrations = vec![
+        Migration {
+            version: 1,
+            description: "create_connections_table",
+            sql: "CREATE TABLE IF NOT EXISTS connections (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL,
             host TEXT NOT NULL,
@@ -125,8 +126,28 @@ pub fn run() {
             protocol TEXT NOT NULL DEFAULT 'rdp',
             created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
         );",
-        kind: MigrationKind::Up,
-    }];
+            kind: MigrationKind::Up,
+        },
+        // Folders + an explicit manual ordering. `sort_order` is a single
+        // sequence shared by the folders and connections inside one parent, so
+        // the UI can drag-sort them together. Existing rows keep their old
+        // (insertion) order by seeding sort_order from the rowid.
+        Migration {
+            version: 2,
+            description: "add_folders_and_sort_order",
+            sql: "CREATE TABLE IF NOT EXISTS folders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            parent_id INTEGER,
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+        );
+        ALTER TABLE connections ADD COLUMN folder_id INTEGER;
+        ALTER TABLE connections ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0;
+        UPDATE connections SET sort_order = id;",
+            kind: MigrationKind::Up,
+        },
+    ];
 
     tauri::Builder::default()
         .plugin(

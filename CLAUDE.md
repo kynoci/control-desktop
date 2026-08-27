@@ -35,7 +35,16 @@ Connection paths share one credential/DB layer. Clicking a connection card uses 
   - `1` strip: `[1][y u16][height u16][rgba...]` → a full-width RGBA row strip drawn via `putImageData`. Dirty rects are widened to full width so pixel data is contiguous. (RDP)
   - `2` status: `[2][utf-8]` → human-readable status/error shown on the tab. (both)
   - `3` rect: `[3][x u16][y u16][w u16][h u16][rgba...]` → an arbitrary dirty rectangle drawn via `putImageData(…, x, y)`. (VNC — RFB updates aren't full-width strips)
+  - `6` ended: `[6][utf-8]` → the session stopped (error or clean close). Deliberately distinct from `2` so the UI can tell "still connecting" from "it stopped" without parsing the wording. (both)
 - **Input** flows back through `rdp_input` / `vnc_input` as JSON tagged events (`move`/`button`/`wheel`/`key`). The mouse events are protocol-neutral; only `key` differs: RDP uses **set-1 scancodes** (`src/scancodes.ts`), VNC uses **X11 keysyms** (`src/keysyms.ts`). Each map must mirror what its backend expects. `onKey` in `App.vue` branches on the active session's protocol.
+
+### Connection organisation (folders & ordering)
+
+- Connections live in a **folder tree** (`folders` table, `parent_id` self-reference; `connections.folder_id`). `NULL` = the root, shown as "Home".
+- Folders and connections inside one parent share **a single `sort_order` sequence**, so drag-sorting can interleave them. `itemsIn(folderId)` in `App.vue` merges both tables into one ordered `Item[]`; `persistOrder()` rewrites `sort_order` as `0..n-1` after a drop.
+- Drag & drop (HTML5 DnD, no library): a card's outer 25% edges mean *insert before/after*, the middle of a **folder** card means *move inside*. Breadcrumb crumbs, sidebar folder rows, and the grid background are also drop targets (all route through `moveInto`). `isDescendantOf` blocks dropping a folder into its own subtree.
+- Deleting a folder **never deletes connections** — its contents are re-parented to the deleted folder's parent.
+- The sidebar tree is rendered from `treeRows`, a *pre-flattened* list of `{item, depth, expanded}` — flattening avoids needing a recursive component inside the single-file `App.vue`.
 
 ### Session model
 
@@ -56,12 +65,13 @@ Connection paths share one credential/DB layer. Clicking a connection card uses 
 - `run_session()`: TCP → `VncConnector` (RFB handshake + auth) → a `tokio::select!` over `{cancel, input_rx, 16ms tick}`. **RFB is request-driven**: the tick drains `poll_event()` (non-blocking) and re-sends `X11Event::Refresh` so the screen keeps updating.
 - **Auth: None + VNC Auth only** (the `vnc-rs` crate does the DES internally). Any other security type (VeNCrypt/TLS, RealVNC RA2, …) is detected via the crate's error string and surfaced as an actionable message (`map_connect_err`) — mirrors `rdp.rs`'s clear-error approach. Plain TCP, no TLS.
 - **Pixels: request `PixelFormat::rgba()`** so rects arrive as `[r,g,b,a]` — forwarded straight to the canvas, no swizzling. A local RGBA framebuffer is kept only to service **CopyRect** (`VncEvent::Copy`), which references previously-drawn pixels.
-- **No client-initiated resize** in `vnc-rs` 0.5.3 — `vnc_resize` is a no-op; server-driven `SetResolution` events *are* handled (re-init + framebuffer realloc). Encodings requested: ZRLE/CopyRect/Raw (no Tight, which would yield JPEG sub-rects).
+- **Client-initiated resize works via a vendored `vnc-rs` patch.** Upstream 0.5.3 has no resize at all, so `src-tauri/vendor/vnc-rs/` adds the `ExtendedDesktopSize` pseudo-encoding (-308), the `SetDesktopSize` client message (251), `X11Event::SetDesktopSize`, and `VncEvent::DesktopResizeSupported`; every change is marked `PATCH (Control Desktop)`. **`SetDesktopSize` must never be sent until the server has sent an `ExtendedDesktopSize` rect** — RFB gives a server no way to skip an unknown client message, so one lacking the extension *drops the connection*. `run_session` therefore gates on `resize_supported` (set by `DesktopResizeSupported`) and, when unsupported, warns the user once instead of sending. Encodings requested: ZRLE/CopyRect/Raw (no Tight, which would yield JPEG sub-rects).
 - See `plan-vnc.md` §3 for the spike findings behind these choices.
 
 ## Important constraints & gotchas
 
 - **`src-tauri/vendor/ironrdp-connector/` is a patched local copy** of ironrdp-connector 0.9.0 (one-line fix to tolerate a Server Deactivate All PDU during capabilities exchange), wired in via `[patch.crates-io]` in `Cargo.toml`. Don't delete it; remove only once the upstream fix lands.
+- **`src-tauri/vendor/vnc-rs/` is likewise a patched local copy** of vnc-rs 0.5.3, adding client-initiated resize (see the VNC section above). Both vendored crates are wired in through the same `[patch.crates-io]` block. Grep `PATCH (Control Desktop)` to see every local change.
 - Crypto uses the **`ring`** rustls backend (not aws-lc) specifically to avoid needing a C/NASM toolchain at build time. Keep it that way unless you're prepared to add that toolchain.
 - The OS window frame is disabled (`decorations: false`); the title bar, tabs, and min/maximize/close buttons are custom HTML in `App.vue` using `data-tauri-drag-region` and `core:window:*` permissions.
 - Any new Tauri command must be added to **both** `generate_handler!` in `lib.rs` **and** the relevant capability in `src-tauri/capabilities/default.json`, or the webview call is rejected.

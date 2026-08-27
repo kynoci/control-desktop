@@ -40,13 +40,23 @@ use crate::ConnectRequest;
 // tag 0 = init:  [0][width u16][height u16]               -> frontend sizes the canvas
 // tag 2 = status:[2][utf-8 message]                       -> human-readable status / error
 // tag 3 = rect:  [3][x u16][y u16][w u16][h u16][rgba..]  -> ctx.putImageData at (x, y)
+// tag 6 = ended: [6][utf-8 message] -> the session is over (error or clean close)
 const TAG_INIT: u8 = 0;
 const TAG_STATUS: u8 = 2;
 const TAG_RECT: u8 = 3;
+const TAG_ENDED: u8 = 6;
 
 fn status_msg(text: &str) -> InvokeResponseBody {
+    tagged(TAG_STATUS, text)
+}
+
+fn ended_msg(text: &str) -> InvokeResponseBody {
+    tagged(TAG_ENDED, text)
+}
+
+fn tagged(tag: u8, text: &str) -> InvokeResponseBody {
     let mut v = Vec::with_capacity(1 + text.len());
-    v.push(TAG_STATUS);
+    v.push(tag);
     v.extend_from_slice(text.as_bytes());
     InvokeResponseBody::Raw(v)
 }
@@ -203,10 +213,10 @@ pub async fn vnc_connect(
         match outcome {
             Err(e) => {
                 log::error!("vnc session {session_id} ended with error: {e}");
-                let _ = frame.send(status_msg(&format!("Disconnected: {e}")));
+                let _ = frame.send(ended_msg(&format!("Disconnected: {e}")));
             }
             Ok(()) => {
-                let _ = frame.send(status_msg("Session closed"));
+                let _ = frame.send(ended_msg("Session closed"));
             }
         }
     });
@@ -254,7 +264,9 @@ async fn run_session(
     mut input_rx: mpsc::UnboundedReceiver<VncInputEvent>,
     cancel: CancellationToken,
 ) -> Result<(), String> {
+    // Mirrors rdp.rs: report each phase, since any of them can stall.
     let server_addr = format!("{}:{}", req.host, req.port);
+    let _ = on_frame.send(status_msg(&format!("Connecting to {server_addr}...")));
     let tcp = TcpStream::connect(&server_addr)
         .await
         .map_err(|e| format!("TCP connect to {server_addr} failed: {e}"))?;
@@ -263,7 +275,7 @@ async fn run_session(
         return Ok(());
     }
 
-    let _ = on_frame.send(status_msg("Authenticating..."));
+    let _ = on_frame.send(status_msg("RFB handshake + authentication..."));
 
     let client = VncConnector::new(tcp)
         .set_auth_method(async move { Ok(password) })

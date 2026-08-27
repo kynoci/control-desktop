@@ -46,10 +46,22 @@ const TAG_STRIP: u8 = 1;
 const TAG_STATUS: u8 = 2;
 // tag 3 = clipboard: [3][utf-8 text] -> remote clipboard text for the webview
 pub(crate) const TAG_CLIPBOARD: u8 = 3;
+// tag 6 = ended: [6][utf-8 message] -> the session is over (error or clean close).
+// Kept distinct from tag 2 so the UI can tell "still working on it" apart from
+// "it stopped", instead of guessing from the wording.
+const TAG_ENDED: u8 = 6;
 
 fn status_msg(text: &str) -> InvokeResponseBody {
+    tagged(TAG_STATUS, text)
+}
+
+fn ended_msg(text: &str) -> InvokeResponseBody {
+    tagged(TAG_ENDED, text)
+}
+
+fn tagged(tag: u8, text: &str) -> InvokeResponseBody {
     let mut v = Vec::with_capacity(1 + text.len());
-    v.push(TAG_STATUS);
+    v.push(tag);
     v.extend_from_slice(text.as_bytes());
     InvokeResponseBody::Raw(v)
 }
@@ -176,10 +188,10 @@ pub async fn rdp_connect(
         match outcome {
             Err(e) => {
                 log::error!("rdp session {session_id} ended with error: {e}");
-                let _ = frame.send(status_msg(&format!("Disconnected: {e}")));
+                let _ = frame.send(ended_msg(&format!("Disconnected: {e}")));
             }
             Ok(()) => {
-                let _ = frame.send(status_msg("Session closed"));
+                let _ = frame.send(ended_msg("Session closed"));
             }
         }
     });
@@ -259,7 +271,7 @@ async fn run_session(
                 return Ok(());
             }
             let clip_backend = WebClipboardBackend::new(clip_local.clone(), clip_tx.clone(), on_frame.clone());
-            match establish(&req, &password, width, height, clip_backend).await {
+            match establish(&req, &password, width, height, clip_backend, &on_frame).await {
                 Ok(pair) => {
                     established = Some(pair);
                     break;
@@ -505,6 +517,7 @@ async fn establish(
     width: u16,
     height: u16,
     clipboard_backend: Box<dyn ironrdp::cliprdr::backend::CliprdrBackend>,
+    on_frame: &Channel<InvokeResponseBody>,
 ) -> Result<
     (
         TokioFramed<tokio_rustls::client::TlsStream<TcpStream>>,
@@ -514,7 +527,10 @@ async fn establish(
 > {
     let config = build_config(&req.username, password.to_owned(), width, height);
 
+    // Each step below can stall for seconds on a slow or unreachable host, so
+    // report them as they start — otherwise the UI just says "connecting".
     let server_addr = format!("{}:{}", req.host, req.port);
+    let _ = on_frame.send(status_msg(&format!("Connecting to {server_addr}...")));
     let tcp = TcpStream::connect(&server_addr)
         .await
         .map_err(|e| format!("TCP connect to {server_addr} failed: {e}"))?;
@@ -529,11 +545,13 @@ async fn establish(
         .with_static_channel(drdynvc)
         .with_static_channel(cliprdr);
 
+    let _ = on_frame.send(status_msg("Negotiating RDP protocol..."));
     let should_upgrade = ironrdp_tokio::connect_begin(&mut framed, &mut connector)
         .await
         .map_err(|e| format!("RDP negotiation failed: {e}"))?;
 
     // The connection must now be wrapped in TLS before CredSSP/NLA continues.
+    let _ = on_frame.send(status_msg("Securing connection (TLS)..."));
     let initial_stream = framed.into_inner_no_leftover();
     let (tls_stream, server_public_key) = tls_upgrade(initial_stream, &req.host)
         .await
@@ -542,6 +560,10 @@ async fn establish(
     let upgraded = ironrdp_tokio::mark_as_upgraded(should_upgrade, &mut connector);
     let mut upgraded_framed = TokioFramed::new(tls_stream);
 
+    let _ = on_frame.send(status_msg(&format!(
+        "Signing in as {} (NLA/CredSSP)...",
+        req.username
+    )));
     let mut network_client = NoKdcNetworkClient;
     let connection_result = ironrdp_tokio::connect_finalize(
         upgraded,
@@ -555,6 +577,7 @@ async fn establish(
     .await
     .map_err(|e| format!("authentication/finalize failed: {e}"))?;
 
+    let _ = on_frame.send(status_msg("Starting desktop session..."));
     Ok((upgraded_framed, connection_result))
 }
 
