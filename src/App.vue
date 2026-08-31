@@ -42,6 +42,8 @@ type Connection = {
   port: number;
   username: string;
   protocol: string;
+  /// 1 = skip the Graphics Pipeline and use the legacy RDP bitmap path (SQLite has no bool).
+  legacy_graphics: number;
   folder_id: number | null;
   sort_order: number;
   created_at: number;
@@ -70,6 +72,7 @@ type Draft = {
   protocol: string;
   password: string;
   folder_id: number | null;
+  legacy_graphics: boolean;
 };
 
 const blankDraft = (folderId: number | null = null): Draft => ({
@@ -81,6 +84,7 @@ const blankDraft = (folderId: number | null = null): Draft => ({
   protocol: "rdp",
   password: "",
   folder_id: folderId,
+  legacy_graphics: false,
 });
 
 const db = ref<Database | null>(null);
@@ -115,7 +119,7 @@ async function loadAll() {
     "SELECT id, name, parent_id, sort_order, created_at FROM folders ORDER BY sort_order, name",
   );
   connections.value = await db.value.select<Connection[]>(
-    "SELECT id, name, host, port, username, protocol, folder_id, sort_order, created_at FROM connections ORDER BY sort_order, name",
+    "SELECT id, name, host, port, username, protocol, folder_id, sort_order, created_at, legacy_graphics FROM connections ORDER BY sort_order, name",
   );
   // The open folder may be gone (deleted); fall back to the root.
   if (currentFolder.value != null && !folders.value.some((f) => f.id === currentFolder.value)) {
@@ -642,6 +646,7 @@ function editConn(c: Connection) {
     protocol: c.protocol,
     password: "",
     folder_id: c.folder_id ?? null,
+    legacy_graphics: !!c.legacy_graphics,
   };
   editing.value = true;
   editingFolder.value = false;
@@ -658,8 +663,8 @@ async function saveDraft() {
     let id: number;
     if (d.id == null) {
       const res = await db.value.execute(
-        "INSERT INTO connections (name, host, port, username, protocol, folder_id, sort_order) VALUES ($1, $2, $3, $4, $5, $6, $7)",
-        [d.name, d.host, d.port, d.username, d.protocol, d.folder_id, itemsIn(d.folder_id).length],
+        "INSERT INTO connections (name, host, port, username, protocol, folder_id, sort_order, legacy_graphics) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+        [d.name, d.host, d.port, d.username, d.protocol, d.folder_id, itemsIn(d.folder_id).length, d.legacy_graphics ? 1 : 0],
       );
       id = Number(res.lastInsertId);
     } else {
@@ -672,8 +677,8 @@ async function saveDraft() {
           ? itemsIn(d.folder_id).length
           : (prev?.sort_order ?? 0);
       await db.value.execute(
-        "UPDATE connections SET name=$1, host=$2, port=$3, username=$4, protocol=$5, folder_id=$6, sort_order=$7 WHERE id=$8",
-        [d.name, d.host, d.port, d.username, d.protocol, d.folder_id, order, id],
+        "UPDATE connections SET name=$1, host=$2, port=$3, username=$4, protocol=$5, folder_id=$6, sort_order=$7, legacy_graphics=$8 WHERE id=$9",
+        [d.name, d.host, d.port, d.username, d.protocol, d.folder_id, order, d.legacy_graphics ? 1 : 0, id],
       );
     }
     if (d.password) {
@@ -771,6 +776,16 @@ function setCanvas(id: number, el: Element | null) {
   if (rt) rt.canvas = (el as HTMLCanvasElement) ?? null;
 }
 
+// Run `fn` when the main thread is idle, so it never delays a frame. Safari and
+// older WebViews have no requestIdleCallback; a macrotask is close enough.
+function scheduleIdle(fn: () => void) {
+  const ric = (window as unknown as {
+    requestIdleCallback?: (cb: () => void, opts?: { timeout: number }) => number;
+  }).requestIdleCallback;
+  if (ric) ric(fn, { timeout: 2000 });
+  else setTimeout(fn, 0);
+}
+
 // Snapshot the session canvas into a small JPEG thumbnail for its connection.
 function captureThumbnail(sessionId: number) {
   const rt = runtimes.get(sessionId);
@@ -787,7 +802,6 @@ function captureThumbnail(sessionId: number) {
     const url = off.toDataURL("image/jpeg", 0.6);
     thumbnails.value = { ...thumbnails.value, [rt.connId]: url };
     localStorage.setItem(`thumb:${rt.connId}`, url);
-    rt.lastThumb = Date.now();
   } catch {
     /* canvas not ready / storage full — skip this capture */
   }
@@ -816,17 +830,6 @@ function handleFrame(id: number, data: ArrayBuffer | unknown) {
       rt.ctx = rt.canvas.getContext("2d");
     }
     setStatus(id, "", "live");
-  } else if (tag === 1) {
-    // strip: [1][y u16][height u16][rgba...]
-    if (!rt.ctx) return;
-    const y = view.getUint16(1, true);
-    const h = view.getUint16(3, true);
-    const rgba = new Uint8ClampedArray(data.slice(5));
-    if (rgba.length === rt.width * h * 4) {
-      rt.ctx.putImageData(new ImageData(rgba, rt.width, h), 0, y);
-    }
-    // Refresh the connection thumbnail at most every few seconds.
-    if (Date.now() - rt.lastThumb > 4000) captureThumbnail(id);
   } else if (tag === 3) {
     // rect: [3][x u16][y u16][w u16][h u16][rgba...] — an arbitrary dirty
     // rectangle: a VNC/RFB update, or an RDP Graphics Pipeline (EGFX) surface
@@ -840,7 +843,14 @@ function handleFrame(id: number, data: ArrayBuffer | unknown) {
     if (rgba.length === w * h * 4) {
       rt.ctx.putImageData(new ImageData(rgba, w, h), x, y);
     }
-    if (Date.now() - rt.lastThumb > 4000) captureThumbnail(id);
+    // A JPEG encode plus a localStorage write costs several milliseconds; running
+    // it between frames would show up as a hitch every few seconds. Stamp the time
+    // now so the capture is only queued once, and let it run when the main thread
+    // is free.
+    if (Date.now() - rt.lastThumb > 4000) {
+      rt.lastThumb = Date.now();
+      scheduleIdle(() => captureThumbnail(id));
+    }
   } else if (tag === 2) {
     // status: [2][utf-8 message] — a disconnect/close/error notice.
     setStatus(id, new TextDecoder().decode(new Uint8Array(data, 1)));
@@ -1086,6 +1096,7 @@ async function startSession(id: number, c: Connection) {
         username: c.username,
         protocol: c.protocol,
         client: "ironrdp",
+        legacy_graphics: !!c.legacy_graphics,
       },
       width,
       height,
@@ -1340,6 +1351,13 @@ onMounted(async () => {
             <option value="rdp">RDP</option>
             <option value="vnc">VNC</option>
           </select>
+        </label>
+        <label v-if="draft.protocol === 'rdp'" class="check">
+          <input type="checkbox" v-model="draft.legacy_graphics" />
+          <span>
+            Legacy graphics
+            <small>Skip the Graphics Pipeline. Use for Windows hosts that render wrong; leave off for Linux/GNOME, which requires it.</small>
+          </span>
         </label>
         <label>
           Folder
@@ -2043,6 +2061,23 @@ button.ghost {
 .form input:focus, .form select:focus {
   outline: none;
   border-color: #3b82f6;
+}
+/* Checkbox rows read as a row, not as a stacked field like the inputs above. */
+.form label.check {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+.form label.check input {
+  display: inline;
+  width: auto;
+  margin-top: 2px;
+}
+.form label.check small {
+  display: block;
+  margin-top: 2px;
+  color: #777;
+  line-height: 1.4;
 }
 
 .details dl {

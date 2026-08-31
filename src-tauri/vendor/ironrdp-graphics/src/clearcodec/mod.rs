@@ -13,16 +13,20 @@ pub use self::vbar_cache::{FullVBar, ShortVBar, VBarCache};
 /// Glyph cache size as u16 for index arithmetic. GLYPH_CACHE_SIZE=4000 fits in u16.
 const GLYPH_CACHE_WRAP: u16 = 4_000;
 
-use ironrdp_core::{DecodeResult, ReadCursor, invalid_field_err};
+use ironrdp_core::{DecodeResult, ReadCursor, ensure_size, invalid_field_err};
 use ironrdp_pdu::codecs::clearcodec::{
-    ClearCodecBitmapStream, CompositePayload, FLAG_GLYPH_INDEX, RgbRunSegment, SubcodecId, VBar, decode_bands_layer,
-    decode_residual_layer, decode_subcodec_layer, encode_residual_layer,
+    Band, ClearCodecBitmapStream, CompositePayload, FLAG_GLYPH_INDEX, MAX_BAND_HEIGHT, RgbRunSegment,
+    ShortVBarCacheMiss, SubcodecId, VBar, decode_residual_layer, decode_subcodec_layer, encode_residual_layer,
 };
 
 /// ClearCodec decoder maintaining persistent cache state across frames.
 pub struct ClearCodecDecoder {
     vbar_cache: VBarCache,
     glyph_cache: GlyphCache,
+    /// PATCH (Control Desktop): one-line notes about regions that did not decode
+    /// exactly, drained by the caller for its log. The crate has no logging facade,
+    /// and silently painting a partial region would hide the reason.
+    diagnostics: Vec<String>,
 }
 
 impl ClearCodecDecoder {
@@ -30,6 +34,19 @@ impl ClearCodecDecoder {
         Self {
             vbar_cache: VBarCache::new(),
             glyph_cache: GlyphCache::new(),
+            diagnostics: Vec::new(),
+        }
+    }
+
+    /// PATCH (Control Desktop): take and clear pending decode notes.
+    pub fn take_diagnostics(&mut self) -> Vec<String> {
+        core::mem::take(&mut self.diagnostics)
+    }
+
+    /// Record a note, bounded — these repeat every frame.
+    fn note(&mut self, msg: String) {
+        if self.diagnostics.len() < 8 {
+            self.diagnostics.push(msg);
         }
     }
 
@@ -159,7 +176,7 @@ impl ClearCodecDecoder {
 
         // Layer 2: Bands (V-bar cached columns) - composite on top
         if !composite.bands_data.is_empty() {
-            let bands = decode_bands_layer(composite.bands_data)?;
+            let bands = decode_bands_layer(composite.bands_data)?; // local, see below
             for band in &bands {
                 let band_height = band.y_end - band.y_start + 1;
                 for (col_offset, vbar) in band.vbars.iter().enumerate() {
@@ -192,7 +209,15 @@ impl ClearCodecDecoder {
         if !composite.subcodec_data.is_empty() {
             let subcodecs = decode_subcodec_layer(composite.subcodec_data)?;
             for sub in &subcodecs {
-                self.decode_subcodec_region(sub, output, width)?;
+                // PATCH (Control Desktop): a region the decoder rejects used to fail
+                // the entire ClearCodec rect, leaving that whole area stale. Skip it
+                // and composite the rest.
+                if let Err(e) = self.decode_subcodec_region(sub, output, width) {
+                    self.note(format!(
+                        "subcodec {:?} region {}x{} at ({},{}) failed: {e}",
+                        sub.codec_id, sub.width, sub.height, sub.x_start, sub.y_start
+                    ));
+                }
             }
         }
 
@@ -248,9 +273,8 @@ impl ClearCodecDecoder {
     }
 
     // NsCodec variant will use decoder state in Phase A7
-    #[expect(clippy::unused_self)]
     fn decode_subcodec_region(
-        &self,
+        &mut self,
         sub: &ironrdp_pdu::codecs::clearcodec::Subcodec<'_>,
         output: &mut [u8],
         surface_width: u16,
@@ -289,50 +313,7 @@ impl ClearCodecDecoder {
                 }
             }
             SubcodecId::Rlex => {
-                let rlex = ironrdp_pdu::codecs::clearcodec::decode_rlex(sub.bitmap_data)?;
-                let w = usize::from(sub.width);
-                let region_pixels = usize::from(sub.width) * usize::from(sub.height);
-                let palette_len = rlex.palette.len();
-                let mut px = 0usize;
-
-                for seg in &rlex.segments {
-                    if usize::from(seg.start_index) >= palette_len {
-                        return Err(invalid_field_err!("rlex", "start_index exceeds palette size"));
-                    }
-                    if usize::from(seg.stop_index) >= palette_len {
-                        return Err(invalid_field_err!("rlex", "stop_index exceeds palette size"));
-                    }
-
-                    let color = &rlex.palette[usize::from(seg.start_index)];
-                    for _ in 0..seg.run_length {
-                        if px >= region_pixels {
-                            return Err(invalid_field_err!("rlex", "run exceeds region pixel count"));
-                        }
-                        let x = usize::from(sub.x_start) + px % w;
-                        let y = usize::from(sub.y_start) + px / w;
-                        let dst_idx = (y * sw + x) * 4;
-                        output[dst_idx] = color[0];
-                        output[dst_idx + 1] = color[1];
-                        output[dst_idx + 2] = color[2];
-                        output[dst_idx + 3] = 0xFF;
-                        px += 1;
-                    }
-
-                    for palette_idx in seg.start_index..=seg.stop_index {
-                        if px >= region_pixels {
-                            return Err(invalid_field_err!("rlex", "suite exceeds region pixel count"));
-                        }
-                        let color = &rlex.palette[usize::from(palette_idx)];
-                        let x = usize::from(sub.x_start) + px % w;
-                        let y = usize::from(sub.y_start) + px / w;
-                        let dst_idx = (y * sw + x) * 4;
-                        output[dst_idx] = color[0];
-                        output[dst_idx + 1] = color[1];
-                        output[dst_idx + 2] = color[2];
-                        output[dst_idx + 3] = 0xFF;
-                        px += 1;
-                    }
-                }
+                self.decode_rlex_region(sub, output, sw)?;
             }
             SubcodecId::NsCodec => {
                 // Not yet implemented; encoder avoids generating NSCodec tiles.
@@ -341,6 +322,259 @@ impl ClearCodecDecoder {
 
         Ok(())
     }
+}
+
+impl ClearCodecDecoder {
+    /// RLEX subcodec (MS-RDPEGFX 2.2.4.1.1.3.1.3).
+    ///
+    /// PATCH (Control Desktop): decoded here instead of through
+    /// `ironrdp_pdu::codecs::clearcodec::decode_rlex`, which special-cases a
+    /// single-entry palette by reading every byte as a run length. The segment header
+    /// byte is always on the wire — with one palette entry the stopIndex field is
+    /// simply zero bits wide and suiteDepth takes all eight — so dropping it
+    /// desynchronised the segment stream and the region ran past its own pixel count
+    /// ("invalid `rlex`: suite exceeds region pixel count" against Windows 11, which
+    /// left taskbar and icon rects stale). Follows FreeRDP
+    /// `clear_decompress_subcode_rlex`, except that running out of room stops the
+    /// region rather than rejecting it: partially decoded pixels beat a dropped rect.
+    fn decode_rlex_region(
+        &mut self,
+        sub: &ironrdp_pdu::codecs::clearcodec::Subcodec<'_>,
+        output: &mut [u8],
+        surface_width: usize,
+    ) -> DecodeResult<()> {
+        /// Spec cap on RLEX palette entries.
+        const MAX_PALETTE_COUNT: u8 = 127;
+
+        let mut src = ReadCursor::new(sub.bitmap_data);
+        ensure_size!(ctx: "RlexPalette", in: src, size: 1);
+        let palette_count = src.read_u8();
+        if palette_count == 0 || palette_count > MAX_PALETTE_COUNT {
+            return Err(invalid_field_err!("paletteCount", "palette count out of range 1..=127"));
+        }
+
+        ensure_size!(ctx: "RlexPalette", in: src, size: usize::from(palette_count) * 3);
+        let mut palette = Vec::with_capacity(usize::from(palette_count));
+        for _ in 0..palette_count {
+            let b = src.read_u8();
+            let g = src.read_u8();
+            let r = src.read_u8();
+            palette.push([b, g, r]);
+        }
+
+        // stopIndex takes ceil(log2(paletteCount)) bits of the header byte and
+        // suiteDepth the rest. u16 masks because a one-entry palette gives suiteDepth
+        // all 8 bits, and `1u8 << 8` would overflow.
+        let stop_bits = if palette_count <= 1 {
+            0
+        } else {
+            32 - u32::from(palette_count - 1).leading_zeros()
+        };
+        let stop_mask = (1u16 << stop_bits) - 1;
+        let depth_mask = (1u16 << (8 - stop_bits)) - 1;
+
+        let region_w = usize::from(sub.width);
+        let region_pixels = region_w * usize::from(sub.height);
+        let x_start = usize::from(sub.x_start);
+        let y_start = usize::from(sub.y_start);
+        let mut px = 0usize;
+        let mut truncated = false;
+
+        // A segment is the header byte plus at least one run-length byte.
+        while src.len() >= 2 && px < region_pixels {
+            let packed = u16::from(src.read_u8());
+            let stop_index = usize::from(packed & stop_mask);
+            let suite_depth = usize::from((packed >> stop_bits) & depth_mask);
+            let start_index = stop_index.saturating_sub(suite_depth);
+            let run_length = read_rlex_run_length(&mut src)?;
+
+            if stop_index >= palette.len() {
+                return Err(invalid_field_err!("rlex", "stop index exceeds palette size"));
+            }
+
+            let run_color = palette[start_index];
+            for _ in 0..run_length {
+                if px >= region_pixels {
+                    truncated = true;
+                    break;
+                }
+                write_rlex_pixel(output, surface_width, x_start, y_start, region_w, px, &run_color);
+                px += 1;
+            }
+
+            for color in &palette[start_index..=stop_index] {
+                if px >= region_pixels {
+                    truncated = true;
+                    break;
+                }
+                write_rlex_pixel(output, surface_width, x_start, y_start, region_w, px, color);
+                px += 1;
+            }
+        }
+
+        if truncated || px != region_pixels {
+            self.note(format!(
+                "rlex region {}x{} palette={palette_count} filled {px}/{region_pixels} px, {} bytes unread",
+                sub.width,
+                sub.height,
+                src.len()
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+/// Bands layer (MS-RDPEGFX 2.2.4.1.1.2).
+///
+/// PATCH (Control Desktop): decoded here rather than through
+/// `ironrdp_pdu::codecs::clearcodec::decode_bands_layer`, whose SHORT_VBAR_CACHE_MISS
+/// parse has the two Y fields swapped: it reads shortVBarYOn from bits 6..13 and
+/// shortVBarYOff from bits 0..5, where the wire puts **shortVBarYOn in the low 8
+/// bits and shortVBarYOff in bits 8..13** — as FreeRDP
+/// `clear_decompress_bands_data` reads them. Real Windows bands therefore failed
+/// the yOff >= yOn sanity check ("invalid `shortVBarCacheMiss`") and the whole
+/// ClearCodec rect was dropped, leaving text and icons stale.
+///
+/// Everything else matches upstream, and it returns upstream types so the
+/// compositing path is unchanged.
+fn decode_bands_layer(data: &[u8]) -> DecodeResult<Vec<Band<'_>>> {
+    /// Band header: 4 x u16 + 3 x u8.
+    const BAND_HEADER_SIZE: usize = 11;
+
+    let mut bands = Vec::new();
+    let mut src = ReadCursor::new(data);
+
+    while src.len() >= BAND_HEADER_SIZE {
+        let x_start = src.read_u16();
+        let x_end = src.read_u16();
+        let y_start = src.read_u16();
+        let y_end = src.read_u16();
+        let blue_bkg = src.read_u8();
+        let green_bkg = src.read_u8();
+        let red_bkg = src.read_u8();
+
+        if x_end < x_start {
+            return Err(invalid_field_err!("xEnd", "xEnd < xStart"));
+        }
+        let height = y_end
+            .checked_sub(y_start)
+            .and_then(|h| h.checked_add(1))
+            .ok_or_else(|| invalid_field_err!("yEnd", "yEnd < yStart"))?;
+        if height > MAX_BAND_HEIGHT {
+            return Err(invalid_field_err!("bandHeight", "band height exceeds 52"));
+        }
+
+        // x_end - x_start can be u16::MAX, so widen before the inclusive +1.
+        let column_count = usize::from(x_end - x_start) + 1;
+        let mut vbars = Vec::with_capacity(column_count);
+        for _ in 0..column_count {
+            vbars.push(decode_vbar(&mut src, height)?);
+        }
+
+        bands.push(Band {
+            x_start,
+            x_end,
+            y_start,
+            y_end,
+            blue_bkg,
+            green_bkg,
+            red_bkg,
+            vbars,
+        });
+    }
+
+    Ok(bands)
+}
+
+/// One V-bar, discriminated by the top two bits of its first word.
+fn decode_vbar<'a>(src: &mut ReadCursor<'a>, band_height: u16) -> DecodeResult<VBar<'a>> {
+    ensure_size!(ctx: "VBar", in: src, size: 2);
+    let first_word = src.read_u16();
+
+    // 1x: full V-bar cache hit, 15-bit index.
+    if first_word & 0x8000 != 0 {
+        return Ok(VBar::CacheHit {
+            index: first_word & 0x7FFF,
+        });
+    }
+
+    // 01: short V-bar cache hit, 14-bit index plus a yOn byte.
+    if first_word & 0x4000 != 0 {
+        let index = first_word & 0x3FFF;
+        ensure_size!(ctx: "ShortVBarCacheHit", in: src, size: 1);
+        let y_on = src.read_u8();
+        return Ok(VBar::ShortCacheHit { index, y_on });
+    }
+
+    // 00: short V-bar cache miss, with inline pixels.
+    //   bits 0..7  = shortVBarYOn  (8 bits)
+    //   bits 8..13 = shortVBarYOff (6 bits)
+    // Pixel count is shortVBarYOff - shortVBarYOn.
+    let y_on = u8::try_from(first_word & 0xFF).expect("masked to 8 bits");
+    let y_off = u8::try_from((first_word >> 8) & 0x3F).expect("masked to 6 bits");
+
+    if y_off < y_on {
+        return Err(invalid_field_err!("shortVBarCacheMiss", "shortVBarYOff < shortVBarYOn"));
+    }
+    if u16::from(y_off) > band_height {
+        return Err(invalid_field_err!(
+            "shortVBarCacheMiss",
+            "shortVBarYOff exceeds band height"
+        ));
+    }
+
+    let pixel_count = y_off - y_on;
+    let pixel_byte_count = usize::from(pixel_count) * 3;
+    ensure_size!(ctx: "ShortVBarCacheMiss", in: src, size: pixel_byte_count);
+    let pixel_data = src.read_slice(pixel_byte_count);
+
+    Ok(VBar::ShortCacheMiss(ShortVBarCacheMiss {
+        y_on,
+        y_off_delta: pixel_count,
+        pixel_data,
+    }))
+}
+
+/// One RLEX pixel, addressed inside its region and written into the whole-bitmap
+/// RGBA buffer.
+#[expect(clippy::too_many_arguments)]
+fn write_rlex_pixel(
+    output: &mut [u8],
+    surface_width: usize,
+    x_start: usize,
+    y_start: usize,
+    region_w: usize,
+    px: usize,
+    color: &[u8; 3],
+) {
+    let x = x_start + px % region_w;
+    let y = y_start + px / region_w;
+    let idx = (y * surface_width + x) * 4;
+    if idx + 3 < output.len() {
+        output[idx] = color[0];
+        output[idx + 1] = color[1];
+        output[idx + 2] = color[2];
+        output[idx + 3] = 0xFF;
+    }
+}
+
+/// RLEX run length: one byte, widening to two then four on an all-ones escape.
+fn read_rlex_run_length(src: &mut ReadCursor<'_>) -> DecodeResult<u32> {
+    ensure_size!(ctx: "RlexRunLength", in: src, size: 1);
+    let factor1 = src.read_u8();
+    if factor1 < 0xFF {
+        return Ok(u32::from(factor1));
+    }
+
+    ensure_size!(ctx: "RlexRunLength", in: src, size: 2);
+    let factor2 = src.read_u16();
+    if factor2 < 0xFFFF {
+        return Ok(u32::from(factor2));
+    }
+
+    ensure_size!(ctx: "RlexRunLength", in: src, size: 4);
+    Ok(src.read_u32())
 }
 
 impl Default for ClearCodecDecoder {
@@ -531,6 +765,158 @@ fn bgra_to_run_segments(bgra: &[u8], pixel_count: usize) -> Vec<RgbRunSegment> {
 #[cfg(test)]
 mod tests {
     use ironrdp_pdu::codecs::clearcodec::{FLAG_CACHE_RESET, FLAG_GLYPH_HIT};
+
+    // PATCH (Control Desktop): coverage for the local RLEX decoder. Upstream has
+    // none, and its single-palette path silently desynchronised the segment stream.
+    use ironrdp_pdu::codecs::clearcodec::{Subcodec, SubcodecId};
+
+    /// Decode one RLEX region into a `region_w` x `region_h` RGBA buffer.
+    fn decode_rlex(bitmap_data: &[u8], region_w: u16, region_h: u16) -> Vec<u8> {
+        let sub = Subcodec {
+            x_start: 0,
+            y_start: 0,
+            width: region_w,
+            height: region_h,
+            codec_id: SubcodecId::Rlex,
+            bitmap_data,
+        };
+        let mut output = vec![0u8; usize::from(region_w) * usize::from(region_h) * 4];
+        let mut decoder = ClearCodecDecoder::new();
+        decoder
+            .decode_rlex_region(&sub, &mut output, usize::from(region_w))
+            .expect("rlex region decodes");
+        output
+    }
+
+    #[test]
+    fn bands_short_vbar_cache_miss_field_order() {
+        // One 1-column band, 4 rows tall. The V-bar word carries shortVBarYOn in
+        // the low 8 bits and shortVBarYOff in bits 8..13: yOn=1, yOff=3 -> 0x0301,
+        // which is 2 rows of inline pixels. Read with the fields swapped (as
+        // upstream does) this decodes as yOn=12, yOff=1 and is rejected outright.
+        let mut data = Vec::new();
+        data.extend_from_slice(&0u16.to_le_bytes()); // xStart
+        data.extend_from_slice(&0u16.to_le_bytes()); // xEnd
+        data.extend_from_slice(&0u16.to_le_bytes()); // yStart
+        data.extend_from_slice(&3u16.to_le_bytes()); // yEnd -> height 4
+        data.extend_from_slice(&[0x11, 0x22, 0x33]); // background BGR
+        data.extend_from_slice(&0x0301u16.to_le_bytes()); // yOn=1, yOff=3
+        data.extend_from_slice(&[1, 2, 3, 4, 5, 6]); // 2 pixels BGR
+
+        let bands = decode_bands_layer(&data).expect("band decodes");
+        assert_eq!(bands.len(), 1);
+        match &bands[0].vbars[..] {
+            [VBar::ShortCacheMiss(miss)] => {
+                assert_eq!(miss.y_on, 1);
+                assert_eq!(miss.y_off_delta, 2);
+                assert_eq!(miss.pixel_data, &[1, 2, 3, 4, 5, 6]);
+            }
+            other => panic!("expected one ShortCacheMiss, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bands_vbar_cache_hits_keep_their_indices() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&0u16.to_le_bytes()); // xStart
+        data.extend_from_slice(&1u16.to_le_bytes()); // xEnd -> 2 columns
+        data.extend_from_slice(&0u16.to_le_bytes()); // yStart
+        data.extend_from_slice(&1u16.to_le_bytes()); // yEnd
+        data.extend_from_slice(&[0, 0, 0]); // background
+        data.extend_from_slice(&(0x8000u16 | 42).to_le_bytes()); // full cache hit, index 42
+        data.extend_from_slice(&(0x4000u16 | 7).to_le_bytes()); // short cache hit, index 7
+        data.push(5); // its yOn byte
+
+        let bands = decode_bands_layer(&data).expect("band decodes");
+        match &bands[0].vbars[..] {
+            [VBar::CacheHit { index: 42 }, VBar::ShortCacheHit { index: 7, y_on: 5 }] => {}
+            other => panic!("unexpected vbars: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rlex_two_palette_run_then_suite() {
+        // paletteCount=2 -> stopIndex is 1 bit, suiteDepth the other 7.
+        let data = [
+            2, // paletteCount
+            0, 0, 0, // palette[0] = black (BGR)
+            255, 255, 255, // palette[1] = white
+            0x00, 2, // stopIndex=0, suiteDepth=0, run=2 -> 2 black + 1 suite black
+            0x01, 0, // stopIndex=1, suiteDepth=0, run=0 -> 1 suite white
+        ];
+
+        let out = decode_rlex(&data, 4, 1);
+        assert_eq!(&out[0..4], &[0, 0, 0, 0xFF]);
+        assert_eq!(&out[4..8], &[0, 0, 0, 0xFF]);
+        assert_eq!(&out[8..12], &[0, 0, 0, 0xFF]);
+        assert_eq!(&out[12..16], &[255, 255, 255, 0xFF]);
+    }
+
+    #[test]
+    fn rlex_suite_walks_the_palette() {
+        // paletteCount=4 -> stopIndex is 2 bits, suiteDepth the other 6.
+        // stopIndex=2, suiteDepth=2 -> startIndex=0, suite walks palette[0..=2].
+        let data = [
+            4, // paletteCount
+            1, 1, 1, // palette[0]
+            2, 2, 2, // palette[1]
+            3, 3, 3, // palette[2]
+            4, 4, 4, // palette[3]
+            0b0000_10_10, 0, // stopIndex=2, suiteDepth=2, run=0
+        ];
+
+        let out = decode_rlex(&data, 3, 1);
+        assert_eq!(&out[0..4], &[1, 1, 1, 0xFF]);
+        assert_eq!(&out[4..8], &[2, 2, 2, 0xFF]);
+        assert_eq!(&out[8..12], &[3, 3, 3, 0xFF]);
+    }
+
+    #[test]
+    fn rlex_single_palette_still_reads_the_header_byte() {
+        // The regression this decoder exists for: with one palette entry the
+        // stopIndex field is zero bits wide, but the header byte is still on the
+        // wire. Reading it as a run length desynchronised every later segment.
+        let data = [
+            1, // paletteCount
+            10, 20, 30, // palette[0] (BGR)
+            0x00, 1, // suiteDepth=0, run=1 -> 1 run pixel + 1 suite pixel
+        ];
+
+        let out = decode_rlex(&data, 2, 1);
+        assert_eq!(&out[0..4], &[10, 20, 30, 0xFF]);
+        assert_eq!(&out[4..8], &[10, 20, 30, 0xFF]);
+    }
+
+    #[test]
+    fn rlex_stops_at_the_region_edge_instead_of_failing() {
+        // A run longer than the region fills it and stops, rather than rejecting
+        // the rect and leaving the area stale.
+        let data = [
+            1, // paletteCount
+            7, 8, 9, // palette[0]
+            0x00, 200, // run=200 into a 2-pixel region
+        ];
+
+        let out = decode_rlex(&data, 2, 1);
+        assert_eq!(&out[0..4], &[7, 8, 9, 0xFF]);
+        assert_eq!(&out[4..8], &[7, 8, 9, 0xFF]);
+    }
+
+    #[test]
+    fn rlex_run_length_escapes_widen() {
+        let mut src = ReadCursor::new(&[0x10]);
+        assert_eq!(read_rlex_run_length(&mut src).unwrap(), 0x10);
+
+        // 0xFF escapes to a u16.
+        let data = [0xFF, 0x34, 0x12];
+        let mut src = ReadCursor::new(&data);
+        assert_eq!(read_rlex_run_length(&mut src).unwrap(), 0x1234);
+
+        // 0xFFFF escapes again to a u32.
+        let data = [0xFF, 0xFF, 0xFF, 0x78, 0x56, 0x34, 0x12];
+        let mut src = ReadCursor::new(&data);
+        assert_eq!(read_rlex_run_length(&mut src).unwrap(), 0x1234_5678);
+    }
 
     use super::*;
 

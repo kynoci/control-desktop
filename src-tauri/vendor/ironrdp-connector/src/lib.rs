@@ -196,6 +196,14 @@ pub struct Config {
     ///
     /// The name will be truncated to the 15 first characters.
     pub client_name: String,
+    /// PATCH (Control Desktop): advertise support for the Graphics Pipeline (EGFX).
+    ///
+    /// Upstream hardcodes this capability bit with no way to opt out. It has to be
+    /// set for servers with no legacy bitmap output path -- `gnome-remote-desktop`
+    /// closes the connection at Capabilities Exchange without it -- but a Windows
+    /// server that sees it stops using the legacy path entirely, which is not always
+    /// what we want. Remove once upstream exposes an equivalent knob.
+    pub enable_egfx: bool,
     pub keyboard_type: gcc::KeyboardType,
     pub keyboard_subtype: u32,
     pub keyboard_functional_keys_count: u32,

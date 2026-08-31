@@ -29,7 +29,6 @@ use ironrdp::displaycontrol::client::DisplayControlClient;
 use ironrdp::dvc::DrdynvcClient;
 use ironrdp::graphics::image_processing::PixelFormat;
 use ironrdp::input::{Database, MouseButton, MousePosition, Operation, Scancode, WheelRotations};
-use ironrdp::pdu::geometry::InclusiveRectangle;
 use ironrdp::session::image::DecodedImage;
 use ironrdp::session::{fast_path, ActiveStage, ActiveStageBuilder, ActiveStageOutput};
 use ironrdp_bulk::BulkCompressor;
@@ -42,11 +41,16 @@ use crate::ConnectRequest;
 
 // --- Channel wire format (raw bytes, little-endian) ----------------------------
 // tag 0 = init:  [0][width u16][height u16]      -> frontend sizes the canvas
-// tag 1 = strip: [1][y u16][height u16][rgba..]  -> full-width RGBA strip at row y
 // tag 2 = status:[2][utf-8 message]              -> human-readable status / error
-// tag 3 = rect:  [3][x][y][w][h][rgba..]         -> arbitrary dirty rect (EGFX)
+// tag 3 = rect:  [3][x][y][w][h][rgba..]         -> arbitrary dirty rect
+//
+// Tag 1 was a full-width RGBA strip: the legacy RDP path widened every dirty
+// rectangle to the desktop width so the pixel data was already contiguous in
+// `DecodedImage`. On a wide desktop that sent roughly seventy times the bytes a
+// small update needed (a caret repaint became 1390x20), which is most of why the
+// legacy path felt heavy. It now copies the rectangle out row by row and sends
+// tag 3 like everything else.
 pub(crate) const TAG_INIT: u8 = 0;
-const TAG_STRIP: u8 = 1;
 const TAG_STATUS: u8 = 2;
 // tag 3 = rect: [3][x u16][y u16][w u16][h u16][rgba..] -> arbitrary dirty rect.
 // Used by the Graphics Pipeline (EGFX) path, whose updates aren't full-width
@@ -358,6 +362,10 @@ async fn run_session(
     // Latest requested desktop size that we couldn't apply yet (e.g. the Display
     // Control channel wasn't ready). Retried after each loop iteration.
     let mut pending_resize: Option<(u16, u16)> = None;
+    // Dirty rectangles from one batch of outputs, merged before they go out: a
+    // single PDU batch often carries several adjacent updates, and one message per
+    // update is what makes a redraw look torn.
+    let mut dirty: Vec<DirtyRect> = Vec::new();
 
     'session: loop {
         let outputs: Vec<ActiveStageOutput> = tokio::select! {
@@ -414,7 +422,12 @@ async fn run_session(
                         .map_err(|e| format!("write failed: {e}"))?;
                 }
                 ActiveStageOutput::GraphicsUpdate(rect) => {
-                    send_strip(&on_frame, &image, &rect)?;
+                    dirty.push(DirtyRect {
+                        x: rect.left,
+                        y: rect.top,
+                        w: rect.right.saturating_sub(rect.left).saturating_add(1),
+                        h: rect.bottom.saturating_sub(rect.top).saturating_add(1),
+                    });
                 }
                 ActiveStageOutput::Terminate(reason) => {
                     log::info!("rdp session terminated: {reason}");
@@ -441,6 +454,12 @@ async fn run_session(
                 // Pointer updates: we rely on the local OS cursor over the canvas,
                 // so the remote pointer sprite is intentionally ignored for now.
                 _ => {}
+            }
+        }
+
+        if !dirty.is_empty() {
+            for rect in merge_rects(std::mem::take(&mut dirty)) {
+                send_image_rect(&on_frame, &image, rect)?;
             }
         }
 
@@ -580,7 +599,11 @@ async fn establish(
     ),
     String,
 > {
-    let config = build_config(&req.username, password.to_owned(), width, height);
+    // The Graphics Pipeline is mandatory for servers with no legacy bitmap path
+    // (gnome-remote-desktop), and optional for Windows, which can stream legacy
+    // surface commands that ironrdp-session decodes itself. See `legacy_graphics`.
+    let enable_egfx = !req.legacy_graphics;
+    let config = build_config(&req.username, password.to_owned(), width, height, enable_egfx);
 
     // Each step below can stall for seconds on a slow or unreachable host, so
     // report them as they start — otherwise the UI just says "connecting".
@@ -597,12 +620,17 @@ async fn establish(
     // bitmap path — notably gnome-remote-desktop; see plan-egfx.md. `None` here is
     // the H.264 decoder: we don't ship one, so the crate negotiates a non-AVC
     // capability set and the server falls back to RemoteFX/uncompressed.
-    let drdynvc = DrdynvcClient::new()
-        .with_dynamic_channel(DisplayControlClient::new(|_| Ok(Vec::new())))
-        .with_dynamic_channel(GraphicsPipelineClient::new(
+    let mut drdynvc = DrdynvcClient::new().with_dynamic_channel(DisplayControlClient::new(|_| Ok(Vec::new())));
+    if enable_egfx {
+        drdynvc = drdynvc.with_dynamic_channel(GraphicsPipelineClient::new(
             Box::new(EgfxHandler::new(on_frame.clone())),
             None,
         ));
+    } else {
+        // Opening the channel while the capability bit is unset would be a protocol
+        // lie, and the server would never use it anyway.
+        log::info!("rdp: legacy graphics requested — EGFX not advertised for this session");
+    }
     let cliprdr: CliprdrClient = Cliprdr::new(clipboard_backend);
     let mut connector = ClientConnector::new(config, client_addr)
         .with_static_channel(drdynvc)
@@ -683,36 +711,188 @@ pub(crate) fn send_rect(
     on_frame.send(InvokeResponseBody::Raw(msg)).map_err(|e| e.to_string())
 }
 
-/// Send the changed rows as a full-width RGBA strip. We widen every dirty
-/// rectangle to the full image width so the pixel data is contiguous in
-/// `DecodedImage` and maps directly onto a canvas `putImageData`.
-fn send_strip(
+/// Copy one dirty rectangle out of the decoded framebuffer and send it as tag 3.
+///
+/// `DecodedImage` is row-major RGBA, so a rectangle narrower than the desktop is
+/// not contiguous and has to be copied row by row — cheap next to sending the
+/// whole width, which is what this replaced.
+fn send_image_rect(
     on_frame: &Channel<InvokeResponseBody>,
     image: &DecodedImage,
-    rect: &InclusiveRectangle,
+    rect: DirtyRect,
 ) -> Result<(), String> {
-    let top = rect.top;
-    let bottom = rect.bottom;
-    let strip_height = bottom - top + 1;
-    let full = InclusiveRectangle {
-        left: 0,
-        top,
-        right: image.width() - 1,
-        bottom,
-    };
-    let data = image.data_for_rect(&full);
+    if rect.w == 0 || rect.h == 0 {
+        return Ok(());
+    }
 
-    let mut msg = Vec::with_capacity(5 + data.len());
-    msg.push(TAG_STRIP);
-    msg.extend_from_slice(&top.to_le_bytes());
-    msg.extend_from_slice(&strip_height.to_le_bytes());
-    msg.extend_from_slice(data);
-    on_frame
-        .send(InvokeResponseBody::Raw(msg))
-        .map_err(|e| e.to_string())
+    let stride = image.stride();
+    let data = image.data();
+    let row_bytes = usize::from(rect.w) * 4;
+    let mut buf = Vec::with_capacity(row_bytes * usize::from(rect.h));
+
+    for row in 0..usize::from(rect.h) {
+        let start = (usize::from(rect.y) + row) * stride + usize::from(rect.x) * 4;
+        let Some(slice) = data.get(start..start + row_bytes) else {
+            // The server named a rectangle outside the framebuffer; drop it rather
+            // than send a short row the canvas would reject anyway.
+            log::warn!(
+                "rdp: dropping {}x{} update at ({},{}) outside the {}x{} framebuffer",
+                rect.w,
+                rect.h,
+                rect.x,
+                rect.y,
+                image.width(),
+                image.height()
+            );
+            return Ok(());
+        };
+        buf.extend_from_slice(slice);
+    }
+
+    send_rect(on_frame, rect.x, rect.y, rect.w, rect.h, &buf)
 }
 
-fn build_config(username: &str, password: String, width: u16, height: u16) -> connector::Config {
+/// A dirty rectangle waiting to be sent.
+#[derive(Clone, Copy)]
+pub(crate) struct DirtyRect {
+    pub x: u16,
+    pub y: u16,
+    pub w: u16,
+    pub h: u16,
+}
+
+/// Above this many rectangles in one batch, stop merging pairwise and just send
+/// the bounding box — the merge is O(n^2) and a batch this fragmented is usually a
+/// full-screen redraw anyway.
+const MAX_MERGED_RECTS: usize = 48;
+
+/// Fold dirty rectangles into as few as possible: EGFX paints a 64x64 tile grid, so
+/// a row of tiles collapses into one rectangle and a full redraw into a handful.
+/// Merges runs that share an edge exactly (same height side by side, or same width
+/// stacked), which is the shape a tile grid produces; anything left over is sent as
+/// it is rather than over-merged into a bounding box that would repaint clean
+/// pixels.
+pub(crate) fn merge_rects(mut rects: Vec<DirtyRect>) -> Vec<DirtyRect> {
+    if rects.len() <= 1 {
+        return rects;
+    }
+
+    // A very fragmented frame is a full redraw in disguise; one bounding box beats
+    // a quadratic merge over hundreds of rectangles.
+    if rects.len() > MAX_MERGED_RECTS {
+        return vec![bounding_box(&rects)];
+    }
+
+    rects.sort_by_key(|r| (r.y, r.x));
+
+    // Horizontal first (tiles arrive in rows), then vertical over the merged rows.
+    let mut merged = merge_pass(rects, true);
+    merged = merge_pass(merged, false);
+    merged
+}
+
+/// One merge pass: `horizontal` joins rectangles that sit side by side with the
+/// same top and height, otherwise ones stacked with the same left and width.
+fn merge_pass(rects: Vec<DirtyRect>, horizontal: bool) -> Vec<DirtyRect> {
+    let mut out: Vec<DirtyRect> = Vec::with_capacity(rects.len());
+
+    for rect in rects {
+        let mut merged = false;
+        for existing in &mut out {
+            let joins = if horizontal {
+                existing.y == rect.y && existing.h == rect.h && existing.x + existing.w == rect.x
+            } else {
+                existing.x == rect.x && existing.w == rect.w && existing.y + existing.h == rect.y
+            };
+            if joins {
+                if horizontal {
+                    existing.w += rect.w;
+                } else {
+                    existing.h += rect.h;
+                }
+                merged = true;
+                break;
+            }
+        }
+        if !merged {
+            out.push(rect);
+        }
+    }
+
+    out
+}
+
+/// Smallest rectangle covering all of `rects`.
+fn bounding_box(rects: &[DirtyRect]) -> DirtyRect {
+    let left = rects.iter().map(|r| r.x).min().unwrap_or(0);
+    let top = rects.iter().map(|r| r.y).min().unwrap_or(0);
+    let right = rects.iter().map(|r| r.x.saturating_add(r.w)).max().unwrap_or(0);
+    let bottom = rects.iter().map(|r| r.y.saturating_add(r.h)).max().unwrap_or(0);
+    DirtyRect {
+        x: left,
+        y: top,
+        w: right.saturating_sub(left),
+        h: bottom.saturating_sub(top),
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Progressive tiles are 64x64; that grid is what the merge exists for.
+    const TILE_PX: u16 = 64;
+
+    fn rect(x: u16, y: u16, w: u16, h: u16) -> DirtyRect {
+        DirtyRect { x, y, w, h }
+    }
+
+    #[test]
+    fn a_row_of_tiles_becomes_one_rect() {
+        // What a progressive refresh actually produces: 64x64 tiles left to right.
+        let tiles = (0..5).map(|i| rect(i * TILE_PX, 0, TILE_PX, TILE_PX)).collect();
+        let merged = merge_rects(tiles);
+        assert_eq!(merged.len(), 1);
+        assert_eq!((merged[0].x, merged[0].y, merged[0].w, merged[0].h), (0, 0, 5 * TILE_PX, TILE_PX));
+    }
+
+    #[test]
+    fn a_block_of_tiles_becomes_one_rect() {
+        let mut tiles = Vec::new();
+        for row in 0..3u16 {
+            for col in 0..4u16 {
+                tiles.push(rect(col * TILE_PX, row * TILE_PX, TILE_PX, TILE_PX));
+            }
+        }
+        let merged = merge_rects(tiles);
+        assert_eq!(merged.len(), 1);
+        assert_eq!((merged[0].w, merged[0].h), (4 * TILE_PX, 3 * TILE_PX));
+    }
+
+    #[test]
+    fn far_apart_rects_are_left_alone() {
+        // Merging these would repaint the whole screen to update a clock and a
+        // cursor, which is exactly what batching is meant to avoid.
+        let merged = merge_rects(vec![rect(0, 0, 16, 16), rect(900, 600, 16, 16)]);
+        assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn a_very_fragmented_frame_collapses_to_its_bounds() {
+        let many = (0..=MAX_MERGED_RECTS as u16)
+            .map(|i| rect(i * 3, i * 5, 2, 2))
+            .collect::<Vec<_>>();
+        let last = *many.last().expect("non-empty");
+        let merged = merge_rects(many);
+        assert_eq!(merged.len(), 1);
+        assert_eq!((merged[0].x, merged[0].y), (0, 0));
+        assert_eq!(merged[0].w, last.x + last.w);
+        assert_eq!(merged[0].h, last.y + last.h);
+    }
+}
+
+fn build_config(username: &str, password: String, width: u16, height: u16, enable_egfx: bool) -> connector::Config {
     use ironrdp::pdu::gcc::KeyboardType;
     use ironrdp::pdu::rdp::capability_sets::MajorPlatformType;
     use ironrdp::pdu::rdp::client_info::{PerformanceFlags, TimezoneInfo};
@@ -732,6 +912,9 @@ fn build_config(username: &str, password: String, width: u16, height: u16) -> co
         keyboard_layout: 0,
         keyboard_functional_keys_count: 12,
         ime_file_name: String::new(),
+        // Advertising EGFX makes a Windows server abandon the legacy path entirely,
+        // so a connection that asked for legacy graphics must not claim it.
+        enable_egfx,
         dig_product_id: String::new(),
         desktop_size: connector::DesktopSize {
             width: width.max(200),

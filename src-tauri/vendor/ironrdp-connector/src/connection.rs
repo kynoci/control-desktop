@@ -839,14 +839,18 @@ fn create_gcc_blocks<'a>(
                         // PATCH (Control Desktop): SUPPORT_NET_CHAR_AUTODETECT removed.
                         // Auto-detect rides the MCS message channel, which we decline
                         // above — don't claim a capability we can't receive.
-                        | ClientEarlyCapabilityFlags::SUPPORT_SKIP_CHANNELJOIN
-                        // PATCH (Control Desktop): advertise the Graphics Pipeline (EGFX).
-                        // gnome-remote-desktop has no legacy bitmap output path and closes
-                        // the connection at Capabilities Exchange when this bit is missing
-                        // ("Client did not advertise support for the Graphics Pipeline").
-                        // Upstream hardcodes this list with no opt-in; remove once a
-                        // `connector::Config` knob exists. See plan-egfx.md.
-                        | ClientEarlyCapabilityFlags::SUPPORT_DYN_VC_GFX_PROTOCOL;
+                        | ClientEarlyCapabilityFlags::SUPPORT_SKIP_CHANNELJOIN;
+
+                    // PATCH (Control Desktop): advertise the Graphics Pipeline (EGFX)
+                    // when the caller asked for it. gnome-remote-desktop has no legacy
+                    // bitmap output path and closes the connection at Capabilities
+                    // Exchange when this bit is missing ("Client did not advertise
+                    // support for the Graphics Pipeline"), while a Windows server that
+                    // sees it abandons the legacy path. Upstream hardcodes the bit with
+                    // no opt-in; remove once a knob exists. See plan-egfx.md.
+                    if config.enable_egfx {
+                        early_capability_flags |= ClientEarlyCapabilityFlags::SUPPORT_DYN_VC_GFX_PROTOCOL;
+                    }
 
                     // TODO(#136): support for ClientEarlyCapabilityFlags::SUPPORT_STATUS_INFO_PDU
 

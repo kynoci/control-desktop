@@ -19,6 +19,14 @@ pub struct ConnectRequest {
     /// embedded client; "mstsc" launches the native Windows client as a fallback.
     #[serde(default)]
     pub client: String,
+    /// Skip the Graphics Pipeline (EGFX) and take the legacy bitmap/surface-command
+    /// path instead, which `ironrdp-session` decodes on its own.
+    ///
+    /// Only meaningful for RDP, and only usable against servers that still have a
+    /// legacy path: Windows does, `gnome-remote-desktop` does not (it drops the
+    /// connection without EGFX), so this stays off by default.
+    #[serde(default)]
+    pub legacy_graphics: bool,
 }
 
 fn keyring_account(connection_id: i64) -> String {
@@ -146,6 +154,15 @@ pub fn run() {
         ALTER TABLE connections ADD COLUMN folder_id INTEGER;
         ALTER TABLE connections ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0;
         UPDATE connections SET sort_order = id;",
+            kind: MigrationKind::Up,
+        },
+        // Opt out of the Graphics Pipeline per connection. Windows still supports
+        // the legacy bitmap path, which ironrdp-session decodes itself; GNOME does
+        // not, so this defaults to off.
+        Migration {
+            version: 3,
+            description: "add_legacy_graphics",
+            sql: "ALTER TABLE connections ADD COLUMN legacy_graphics INTEGER NOT NULL DEFAULT 0;",
             kind: MigrationKind::Up,
         },
     ];

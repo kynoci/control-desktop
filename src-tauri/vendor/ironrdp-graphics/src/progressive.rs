@@ -1106,11 +1106,19 @@ impl ProgressiveDecoder {
             _ => None,
         }) {
             Some(v) => v,
+            // PATCH (Control Desktop): Windows opens a progressive stream whose
+            // first frame for a context carries no CONTEXT block, and rejecting it
+            // froze the screen ("progressive stream missing CONTEXT block" in the
+            // log). Fall back to another live context first -- a server picks one
+            // DWT mode for the whole session -- and otherwise to reduce-extrapolate,
+            // which is what RDP servers that omit the block use. FreeRDP is
+            // likewise permissive: it keeps whatever flags its context already holds
+            // rather than dropping the frame.
             None => self
                 .contexts
                 .get(&codec_context_id)
-                .map(|c| c.surface.use_reduce_extrapolate)
-                .ok_or(ProgressiveDecodeError::MissingBlock("CONTEXT"))?,
+                .or_else(|| self.contexts.values().next())
+                .map_or(true, |c| c.surface.use_reduce_extrapolate),
         };
 
         // Get or create the context for this codec_context_id
@@ -1131,6 +1139,7 @@ impl ProgressiveDecoder {
         context.surface.use_reduce_extrapolate = use_reduce_extrapolate;
 
         let mut decoded_tiles = Vec::new();
+        let mut first_error = None;
 
         // Process REGION blocks (the main content)
         for block in &blocks {
@@ -1143,14 +1152,30 @@ impl ProgressiveDecoder {
             let prog_quant_vals = &region.quant_prog_vals;
 
             for tile_block in &region.tiles {
-                let tiles = decode_tile_block(
+                // PATCH (Control Desktop): a tile the decoder chokes on used to abort
+                // the whole PDU, so one bad tile blanked every other tile in the
+                // frame. Keep decoding, and only surface the error if nothing at all
+                // decoded.
+                match decode_tile_block(
                     &mut context.surface,
                     tile_block,
                     quant_vals,
                     prog_quant_vals,
                     use_reduce_extrapolate,
-                )?;
-                decoded_tiles.extend(tiles);
+                ) {
+                    Ok(tiles) => decoded_tiles.extend(tiles),
+                    Err(e) => {
+                        if first_error.is_none() {
+                            first_error = Some(e);
+                        }
+                    }
+                }
+            }
+        }
+
+        if decoded_tiles.is_empty() {
+            if let Some(e) = first_error {
+                return Err(e);
             }
         }
 
@@ -1169,6 +1194,10 @@ impl ProgressiveDecoder {
         self.contexts.clear();
     }
 }
+
+/// A `quality` byte of 0xFF means "full quality": use the lossless progressive
+/// quant instead of looking one up in the region table (MS-RDPEGFX 2.2.4.2.1.5).
+const FULL_QUALITY: u8 = 0xFF;
 
 #[expect(
     clippy::similar_names,
@@ -1240,14 +1269,31 @@ fn decode_tile_block(
                 });
             }
 
-            let pq_idx = usize::from(tile.quality);
-            if pq_idx >= prog_quant_vals.len() {
-                return Err(ProgressiveDecodeError::InvalidQuantIndex {
-                    index: pq_idx,
-                    table_len: prog_quant_vals.len(),
-                });
-            }
-            let pq = &prog_quant_vals[pq_idx];
+            // PATCH (Control Desktop): `quality` 0xFF is a sentinel, not an index.
+            // MS-RDPEGFX 2.2.4.2.1.5 defines it as full quality -- no progressive
+            // quantization -- and Windows sends it with numProgQuant == 0. Indexing
+            // the (empty) table rejected the tile, and since `decode_bitmap`
+            // propagated the error it took the whole frame with it, so a Windows
+            // desktop never redrew. FreeRDP's
+            // `progressive_decompress_tile_{first,upgrade}` substitutes the lossless
+            // quant here; do the same.
+            let pq = match tile.quality {
+                FULL_QUALITY => ironrdp_pdu::codecs::rfx::progressive::ProgressiveCodecQuant {
+                    quality: FULL_QUALITY,
+                    y_quant: ComponentCodecQuant::LOSSLESS,
+                    cb_quant: ComponentCodecQuant::LOSSLESS,
+                    cr_quant: ComponentCodecQuant::LOSSLESS,
+                },
+                quality => {
+                    let pq_idx = usize::from(quality);
+                    *prog_quant_vals
+                        .get(pq_idx)
+                        .ok_or(ProgressiveDecodeError::InvalidQuantIndex {
+                            index: pq_idx,
+                            table_len: prog_quant_vals.len(),
+                        })?
+                }
+            };
 
             tile_state.decode_first(
                 [tile.y_data, tile.cb_data, tile.cr_data],
@@ -1277,14 +1323,31 @@ fn decode_tile_block(
                 return Ok(Vec::new());
             }
 
-            let pq_idx = usize::from(tile.quality);
-            if pq_idx >= prog_quant_vals.len() {
-                return Err(ProgressiveDecodeError::InvalidQuantIndex {
-                    index: pq_idx,
-                    table_len: prog_quant_vals.len(),
-                });
-            }
-            let pq = &prog_quant_vals[pq_idx];
+            // PATCH (Control Desktop): `quality` 0xFF is a sentinel, not an index.
+            // MS-RDPEGFX 2.2.4.2.1.5 defines it as full quality -- no progressive
+            // quantization -- and Windows sends it with numProgQuant == 0. Indexing
+            // the (empty) table rejected the tile, and since `decode_bitmap`
+            // propagated the error it took the whole frame with it, so a Windows
+            // desktop never redrew. FreeRDP's
+            // `progressive_decompress_tile_{first,upgrade}` substitutes the lossless
+            // quant here; do the same.
+            let pq = match tile.quality {
+                FULL_QUALITY => ironrdp_pdu::codecs::rfx::progressive::ProgressiveCodecQuant {
+                    quality: FULL_QUALITY,
+                    y_quant: ComponentCodecQuant::LOSSLESS,
+                    cb_quant: ComponentCodecQuant::LOSSLESS,
+                    cr_quant: ComponentCodecQuant::LOSSLESS,
+                },
+                quality => {
+                    let pq_idx = usize::from(quality);
+                    *prog_quant_vals
+                        .get(pq_idx)
+                        .ok_or(ProgressiveDecodeError::InvalidQuantIndex {
+                            index: pq_idx,
+                            table_len: prog_quant_vals.len(),
+                        })?
+                }
+            };
 
             tile_state.decode_upgrade(
                 [tile.y_srl_data, tile.cb_srl_data, tile.cr_srl_data],
