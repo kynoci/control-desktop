@@ -35,6 +35,25 @@ function winClose() {
   appWindow.close();
 }
 
+// The host's operating system. "linux" covers every distribution — the only thing
+// the app does with it is pick a graphics path, and that splits Windows from the
+// rest, not Ubuntu from Fedora.
+type OsName = "windows" | "linux" | "macos";
+
+const OS_OPTIONS: { value: OsName; label: string }[] = [
+  { value: "windows", label: "Windows" },
+  { value: "linux", label: "Linux" },
+  { value: "macos", label: "macOS" },
+];
+
+// Windows still has a full legacy bitmap/surface-command path, which
+// `ironrdp-session` decodes itself and which renders correctly today; the Graphics
+// Pipeline is the newer path and its ClearCodec/Planar handling is still settling.
+// Linux (gnome-remote-desktop) has no legacy path at all and drops the connection
+// without EGFX, so it — and macOS, for want of a legacy path to assume — keeps it.
+// RDP only; VNC ignores this entirely.
+const legacyGraphicsFor = (os: OsName) => os === "windows";
+
 type Connection = {
   id: number;
   name: string;
@@ -42,7 +61,11 @@ type Connection = {
   port: number;
   username: string;
   protocol: string;
+  /// Host OS, chosen by the user: nothing pre-auth identifies it. Drives the RDP
+  /// graphics path via `legacyGraphicsFor`.
+  os: OsName;
   /// 1 = skip the Graphics Pipeline and use the legacy RDP bitmap path (SQLite has no bool).
+  /// Derived from `os` — never edited directly.
   legacy_graphics: number;
   folder_id: number | null;
   sort_order: number;
@@ -72,7 +95,7 @@ type Draft = {
   protocol: string;
   password: string;
   folder_id: number | null;
-  legacy_graphics: boolean;
+  os: OsName;
 };
 
 const blankDraft = (folderId: number | null = null): Draft => ({
@@ -84,7 +107,7 @@ const blankDraft = (folderId: number | null = null): Draft => ({
   protocol: "rdp",
   password: "",
   folder_id: folderId,
-  legacy_graphics: false,
+  os: "windows",
 });
 
 const db = ref<Database | null>(null);
@@ -119,7 +142,7 @@ async function loadAll() {
     "SELECT id, name, parent_id, sort_order, created_at FROM folders ORDER BY sort_order, name",
   );
   connections.value = await db.value.select<Connection[]>(
-    "SELECT id, name, host, port, username, protocol, folder_id, sort_order, created_at, legacy_graphics FROM connections ORDER BY sort_order, name",
+    "SELECT id, name, host, port, username, protocol, folder_id, sort_order, created_at, legacy_graphics, os FROM connections ORDER BY sort_order, name",
   );
   // The open folder may be gone (deleted); fall back to the root.
   if (currentFolder.value != null && !folders.value.some((f) => f.id === currentFolder.value)) {
@@ -646,7 +669,7 @@ function editConn(c: Connection) {
     protocol: c.protocol,
     password: "",
     folder_id: c.folder_id ?? null,
-    legacy_graphics: !!c.legacy_graphics,
+    os: c.os ?? "windows",
   };
   editing.value = true;
   editingFolder.value = false;
@@ -663,8 +686,10 @@ async function saveDraft() {
     let id: number;
     if (d.id == null) {
       const res = await db.value.execute(
-        "INSERT INTO connections (name, host, port, username, protocol, folder_id, sort_order, legacy_graphics) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
-        [d.name, d.host, d.port, d.username, d.protocol, d.folder_id, itemsIn(d.folder_id).length, d.legacy_graphics ? 1 : 0],
+        "INSERT INTO connections (name, host, port, username, protocol, folder_id, sort_order, os, legacy_graphics) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+        // legacy_graphics is derived from os, written alongside it so the row stays
+        // self-consistent for anything reading the column directly.
+        [d.name, d.host, d.port, d.username, d.protocol, d.folder_id, itemsIn(d.folder_id).length, d.os, legacyGraphicsFor(d.os) ? 1 : 0],
       );
       id = Number(res.lastInsertId);
     } else {
@@ -677,8 +702,8 @@ async function saveDraft() {
           ? itemsIn(d.folder_id).length
           : (prev?.sort_order ?? 0);
       await db.value.execute(
-        "UPDATE connections SET name=$1, host=$2, port=$3, username=$4, protocol=$5, folder_id=$6, sort_order=$7, legacy_graphics=$8 WHERE id=$9",
-        [d.name, d.host, d.port, d.username, d.protocol, d.folder_id, order, d.legacy_graphics ? 1 : 0, id],
+        "UPDATE connections SET name=$1, host=$2, port=$3, username=$4, protocol=$5, folder_id=$6, sort_order=$7, os=$8, legacy_graphics=$9 WHERE id=$10",
+        [d.name, d.host, d.port, d.username, d.protocol, d.folder_id, order, d.os, legacyGraphicsFor(d.os) ? 1 : 0, id],
       );
     }
     if (d.password) {
@@ -786,6 +811,16 @@ function scheduleIdle(fn: () => void) {
   else setTimeout(fn, 0);
 }
 
+// Refresh the connection thumbnail at most every few seconds. A JPEG encode plus
+// a localStorage write costs several milliseconds; running it between frames would
+// show up as a hitch. Stamp the time now so the capture is only queued once, and
+// let it run when the main thread is free.
+function queueThumbnail(sessionId: number, rt: Runtime) {
+  if (Date.now() - rt.lastThumb <= 4000) return;
+  rt.lastThumb = Date.now();
+  scheduleIdle(() => captureThumbnail(sessionId));
+}
+
 // Snapshot the session canvas into a small JPEG thumbnail for its connection.
 function captureThumbnail(sessionId: number) {
   const rt = runtimes.get(sessionId);
@@ -830,6 +865,17 @@ function handleFrame(id: number, data: ArrayBuffer | unknown) {
       rt.ctx = rt.canvas.getContext("2d");
     }
     setStatus(id, "", "live");
+  } else if (tag === 1) {
+    // strip: [1][y u16][height u16][rgba...] — the legacy RDP path's update, a
+    // band spanning the full desktop width. One putImageData for the whole band.
+    if (!rt.ctx) return;
+    const y = view.getUint16(1, true);
+    const h = view.getUint16(3, true);
+    const rgba = new Uint8ClampedArray(data.slice(5));
+    if (rgba.length === rt.width * h * 4) {
+      rt.ctx.putImageData(new ImageData(rgba, rt.width, h), 0, y);
+    }
+    queueThumbnail(id, rt);
   } else if (tag === 3) {
     // rect: [3][x u16][y u16][w u16][h u16][rgba...] — an arbitrary dirty
     // rectangle: a VNC/RFB update, or an RDP Graphics Pipeline (EGFX) surface
@@ -843,14 +889,7 @@ function handleFrame(id: number, data: ArrayBuffer | unknown) {
     if (rgba.length === w * h * 4) {
       rt.ctx.putImageData(new ImageData(rgba, w, h), x, y);
     }
-    // A JPEG encode plus a localStorage write costs several milliseconds; running
-    // it between frames would show up as a hitch every few seconds. Stamp the time
-    // now so the capture is only queued once, and let it run when the main thread
-    // is free.
-    if (Date.now() - rt.lastThumb > 4000) {
-      rt.lastThumb = Date.now();
-      scheduleIdle(() => captureThumbnail(id));
-    }
+    queueThumbnail(id, rt);
   } else if (tag === 2) {
     // status: [2][utf-8 message] — a disconnect/close/error notice.
     setStatus(id, new TextDecoder().decode(new Uint8Array(data, 1)));
@@ -1096,7 +1135,8 @@ async function startSession(id: number, c: Connection) {
         username: c.username,
         protocol: c.protocol,
         client: "ironrdp",
-        legacy_graphics: !!c.legacy_graphics,
+        // `os` is the source of truth; the stored column is only a cached copy.
+        legacy_graphics: legacyGraphicsFor(c.os ?? "windows"),
       },
       width,
       height,
@@ -1352,12 +1392,18 @@ onMounted(async () => {
             <option value="vnc">VNC</option>
           </select>
         </label>
-        <label v-if="draft.protocol === 'rdp'" class="check">
-          <input type="checkbox" v-model="draft.legacy_graphics" />
-          <span>
-            Legacy graphics
-            <small>Skip the Graphics Pipeline. Use for Windows hosts that render wrong; leave off for Linux/GNOME, which requires it.</small>
-          </span>
+        <label>
+          Operating system
+          <select v-model="draft.os">
+            <option v-for="o in OS_OPTIONS" :key="o.value" :value="o.value">{{ o.label }}</option>
+          </select>
+          <small v-if="draft.protocol === 'rdp'">
+            {{
+              legacyGraphicsFor(draft.os)
+                ? "Windows renders through its legacy bitmap path."
+                : "Uses the Graphics Pipeline (EGFX), which Linux hosts require."
+            }}
+          </small>
         </label>
         <label>
           Folder
@@ -2062,21 +2108,12 @@ button.ghost {
   outline: none;
   border-color: #3b82f6;
 }
-/* Checkbox rows read as a row, not as a stacked field like the inputs above. */
-.form label.check {
-  display: flex;
-  align-items: flex-start;
-  gap: 8px;
-}
-.form label.check input {
-  display: inline;
-  width: auto;
-  margin-top: 2px;
-}
-.form label.check small {
+/* Hint line under a field, explaining what the choice above it implies. */
+.form label small {
   display: block;
-  margin-top: 2px;
+  margin-top: 4px;
   color: #777;
+  font-size: 12px;
   line-height: 1.4;
 }
 

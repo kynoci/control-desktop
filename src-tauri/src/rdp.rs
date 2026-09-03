@@ -29,6 +29,7 @@ use ironrdp::displaycontrol::client::DisplayControlClient;
 use ironrdp::dvc::DrdynvcClient;
 use ironrdp::graphics::image_processing::PixelFormat;
 use ironrdp::input::{Database, MouseButton, MousePosition, Operation, Scancode, WheelRotations};
+use ironrdp::pdu::geometry::InclusiveRectangle;
 use ironrdp::session::image::DecodedImage;
 use ironrdp::session::{fast_path, ActiveStage, ActiveStageBuilder, ActiveStageOutput};
 use ironrdp_bulk::BulkCompressor;
@@ -41,16 +42,19 @@ use crate::ConnectRequest;
 
 // --- Channel wire format (raw bytes, little-endian) ----------------------------
 // tag 0 = init:  [0][width u16][height u16]      -> frontend sizes the canvas
+// tag 1 = strip: [1][y u16][height u16][rgba..]  -> full-width RGBA strip at row y
 // tag 2 = status:[2][utf-8 message]              -> human-readable status / error
 // tag 3 = rect:  [3][x][y][w][h][rgba..]         -> arbitrary dirty rect
-//
-// Tag 1 was a full-width RGBA strip: the legacy RDP path widened every dirty
-// rectangle to the desktop width so the pixel data was already contiguous in
-// `DecodedImage`. On a wide desktop that sent roughly seventy times the bytes a
-// small update needed (a caret repaint became 1390x20), which is most of why the
-// legacy path felt heavy. It now copies the rectangle out row by row and sends
-// tag 3 like everything else.
 pub(crate) const TAG_INIT: u8 = 0;
+// tag 1 = strip: the legacy path's update format. It widens every dirty rectangle
+// to the desktop width, which sends far more bytes than the rectangle needs — but
+// the pixels are then already contiguous in `DecodedImage`, so it is one memcpy
+// into the message and one `putImageData` on the canvas. The per-rectangle tag-3
+// encoding that briefly replaced it sent less data but cost two copies (row by row
+// into a buffer, then into the message) and measured *worse* on Windows, which
+// tends to emit full-width surface bits anyway. EGFX keeps tag 3, where the
+// updates are genuinely small tiles.
+const TAG_STRIP: u8 = 1;
 const TAG_STATUS: u8 = 2;
 // tag 3 = rect: [3][x u16][y u16][w u16][h u16][rgba..] -> arbitrary dirty rect.
 // Used by the Graphics Pipeline (EGFX) path, whose updates aren't full-width
@@ -362,15 +366,35 @@ async fn run_session(
     // Latest requested desktop size that we couldn't apply yet (e.g. the Display
     // Control channel wasn't ready). Retried after each loop iteration.
     let mut pending_resize: Option<(u16, u16)> = None;
-    // Dirty rectangles from one batch of outputs, merged before they go out: a
-    // single PDU batch often carries several adjacent updates, and one message per
-    // update is what makes a redraw look torn.
-    let mut dirty: Vec<DirtyRect> = Vec::new();
+    // Throughput of the legacy path, summarised every few seconds. Strips are
+    // full-width, so a server dirtying a caret and one repainting the desktop look
+    // identical from outside — these numbers separate "few large updates" (fine)
+    // from "full-screen repaint every frame" (why it would feel heavy).
+    let mut stat = LegacyStats::new();
+    // Paints waiting to be presented as one frame. The server splits a single
+    // screen update across several fast-path PDUs, and `ironrdp-session` gives us
+    // one `GraphicsUpdate` per PDU — painting each as it lands is what makes a
+    // window open as a top-to-bottom wipe instead of appearing at once, the way
+    // mstsc shows it. Adjacent bands are merged and presented together.
+    let mut pending_paint: Vec<DirtyRect> = Vec::new();
+    let mut paint_deadline: Option<tokio::time::Instant> = None;
 
     'session: loop {
         let outputs: Vec<ActiveStageOutput> = tokio::select! {
             biased;
             _ = cancel.cancelled() => break 'session,
+            // A frame is due. Polled before the reader so a burst of PDUs cannot
+            // starve the present and stretch one frame into a visible wipe.
+            () = async {
+                match paint_deadline {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                flush_paint(&on_frame, &image, &mut pending_paint)?;
+                paint_deadline = None;
+                Vec::new()
+            }
             maybe = resize_rx.recv() => {
                 match maybe {
                     // Coalesce to the most recent size; applied below once per loop.
@@ -422,12 +446,19 @@ async fn run_session(
                         .map_err(|e| format!("write failed: {e}"))?;
                 }
                 ActiveStageOutput::GraphicsUpdate(rect) => {
-                    dirty.push(DirtyRect {
-                        x: rect.left,
+                    stat.record(&rect, image.width());
+                    // Widened to the full desktop here rather than at send time, so
+                    // that vertically adjacent bands merge into one strip — which is
+                    // exactly the shape a fragmented screen update arrives in.
+                    pending_paint.push(DirtyRect {
+                        x: 0,
                         y: rect.top,
-                        w: rect.right.saturating_sub(rect.left).saturating_add(1),
+                        w: image.width(),
                         h: rect.bottom.saturating_sub(rect.top).saturating_add(1),
                     });
+                    if paint_deadline.is_none() {
+                        paint_deadline = Some(tokio::time::Instant::now() + COALESCE_WINDOW);
+                    }
                 }
                 ActiveStageOutput::Terminate(reason) => {
                     log::info!("rdp session terminated: {reason}");
@@ -457,11 +488,7 @@ async fn run_session(
             }
         }
 
-        if !dirty.is_empty() {
-            for rect in merge_rects(std::mem::take(&mut dirty)) {
-                send_image_rect(&on_frame, &image, rect)?;
-            }
-        }
+        stat.report();
 
         // Apply a pending resize once the Display Control channel is ready.
         if let Some((w, h)) = pending_resize {
@@ -711,45 +738,117 @@ pub(crate) fn send_rect(
     on_frame.send(InvokeResponseBody::Raw(msg)).map_err(|e| e.to_string())
 }
 
-/// Copy one dirty rectangle out of the decoded framebuffer and send it as tag 3.
+/// How long a paint waits for the rest of its frame before being presented.
 ///
-/// `DecodedImage` is row-major RGBA, so a rectangle narrower than the desktop is
-/// not contiguous and has to be copied row by row — cheap next to sending the
-/// whole width, which is what this replaced.
-fn send_image_rect(
+/// The server fragments one screen update across several fast-path PDUs; this is
+/// the window in which those pieces are collected so they appear together. Half a
+/// 60Hz frame: long enough to catch the fragments of one update, short enough that
+/// it is not felt as input lag. Nothing is ever held longer than this.
+const COALESCE_WINDOW: std::time::Duration = std::time::Duration::from_millis(8);
+
+/// Present everything collected since the last frame: merge the bands (a run of
+/// adjacent full-width bands becomes one strip) and send them.
+fn flush_paint(
     on_frame: &Channel<InvokeResponseBody>,
     image: &DecodedImage,
-    rect: DirtyRect,
+    pending: &mut Vec<DirtyRect>,
 ) -> Result<(), String> {
-    if rect.w == 0 || rect.h == 0 {
+    if pending.is_empty() {
         return Ok(());
     }
+    for rect in merge_rects(std::mem::take(pending)) {
+        send_strip(on_frame, image, rect.y, rect.h)?;
+    }
+    Ok(())
+}
 
-    let stride = image.stride();
-    let data = image.data();
-    let row_bytes = usize::from(rect.w) * 4;
-    let mut buf = Vec::with_capacity(row_bytes * usize::from(rect.h));
+/// Throughput counters for the legacy path, logged at most every `REPORT_EVERY`
+/// and only while updates are actually flowing (an idle desktop stays silent).
+struct LegacyStats {
+    updates: u64,
+    /// Rows actually dirtied, before `send_strip` widens them.
+    rows: u64,
+    /// Bytes put on the channel, i.e. rows widened to the full desktop.
+    bytes: u64,
+    /// Updates already spanning the full desktop width — nothing to widen, so the
+    /// strip encoding costs them nothing.
+    full_width: u64,
+    since: std::time::Instant,
+}
 
-    for row in 0..usize::from(rect.h) {
-        let start = (usize::from(rect.y) + row) * stride + usize::from(rect.x) * 4;
-        let Some(slice) = data.get(start..start + row_bytes) else {
-            // The server named a rectangle outside the framebuffer; drop it rather
-            // than send a short row the canvas would reject anyway.
-            log::warn!(
-                "rdp: dropping {}x{} update at ({},{}) outside the {}x{} framebuffer",
-                rect.w,
-                rect.h,
-                rect.x,
-                rect.y,
-                image.width(),
-                image.height()
-            );
-            return Ok(());
-        };
-        buf.extend_from_slice(slice);
+impl LegacyStats {
+    const REPORT_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
+
+    fn new() -> Self {
+        Self {
+            updates: 0,
+            rows: 0,
+            bytes: 0,
+            full_width: 0,
+            since: std::time::Instant::now(),
+        }
     }
 
-    send_rect(on_frame, rect.x, rect.y, rect.w, rect.h, &buf)
+    fn record(&mut self, rect: &InclusiveRectangle, image_width: u16) {
+        let rows = u64::from(rect.bottom.saturating_sub(rect.top)) + 1;
+        let width = u64::from(rect.right.saturating_sub(rect.left)) + 1;
+        self.updates += 1;
+        self.rows += rows;
+        self.bytes += rows * u64::from(image_width) * 4;
+        if width >= u64::from(image_width) {
+            self.full_width += 1;
+        }
+    }
+
+    fn report(&mut self) {
+        let elapsed = self.since.elapsed();
+        if self.updates == 0 || elapsed < Self::REPORT_EVERY {
+            return;
+        }
+        let secs = elapsed.as_secs_f64();
+        log::info!(
+            "rdp legacy: {:.1} updates/s, {:.1} rows/update, {:.1} MB/s on the wire, {}% already full-width",
+            self.updates as f64 / secs,
+            self.rows as f64 / self.updates as f64,
+            self.bytes as f64 / secs / (1024.0 * 1024.0),
+            self.full_width * 100 / self.updates,
+        );
+        *self = Self::new();
+    }
+}
+
+/// Send the changed rows as a full-width RGBA strip (tag 1) — the legacy path's
+/// update format, used only when EGFX is off.
+///
+/// Every dirty rectangle is widened to the full image width so the pixel data is
+/// already contiguous in `DecodedImage`: one slice, one memcpy into the message,
+/// one `putImageData` on the canvas. That costs bandwidth on a narrow update and
+/// saves CPU on a wide one, and Windows' legacy surface bits are usually wide.
+fn send_strip(
+    on_frame: &Channel<InvokeResponseBody>,
+    image: &DecodedImage,
+    top: u16,
+    height: u16,
+) -> Result<(), String> {
+    if height == 0 || top >= image.height() {
+        return Ok(());
+    }
+    let bottom = top.saturating_add(height - 1).min(image.height().saturating_sub(1));
+    let strip_height = bottom - top + 1;
+    let full = InclusiveRectangle {
+        left: 0,
+        top,
+        right: image.width().saturating_sub(1),
+        bottom,
+    };
+    let data = image.data_for_rect(&full);
+
+    let mut msg = Vec::with_capacity(5 + data.len());
+    msg.push(TAG_STRIP);
+    msg.extend_from_slice(&top.to_le_bytes());
+    msg.extend_from_slice(&strip_height.to_le_bytes());
+    msg.extend_from_slice(data);
+    on_frame.send(InvokeResponseBody::Raw(msg)).map_err(|e| e.to_string())
 }
 
 /// A dirty rectangle waiting to be sent.
@@ -868,6 +967,27 @@ mod tests {
         let merged = merge_rects(tiles);
         assert_eq!(merged.len(), 1);
         assert_eq!((merged[0].w, merged[0].h), (4 * TILE_PX, 3 * TILE_PX));
+    }
+
+    #[test]
+    fn stacked_full_width_bands_become_one_strip() {
+        // The legacy case: one screen update arrives split across several fast-path
+        // PDUs as consecutive full-width bands. Presenting them separately is the
+        // top-to-bottom wipe; they have to come out as a single strip.
+        const W: u16 = 1000;
+        let bands = (0..6).map(|i| rect(0, i * 40, W, 40)).collect();
+        let merged = merge_rects(bands);
+        assert_eq!(merged.len(), 1);
+        assert_eq!((merged[0].y, merged[0].h), (0, 240));
+    }
+
+    #[test]
+    fn a_gap_between_bands_is_not_bridged() {
+        // Two updates far apart vertically must stay apart — merging them would
+        // repaint everything between, which is the cost the strip encoding already
+        // pays once per band.
+        let merged = merge_rects(vec![rect(0, 0, 1000, 40), rect(0, 600, 1000, 40)]);
+        assert_eq!(merged.len(), 2);
     }
 
     #[test]

@@ -24,7 +24,8 @@ pub struct ConnectRequest {
     ///
     /// Only meaningful for RDP, and only usable against servers that still have a
     /// legacy path: Windows does, `gnome-remote-desktop` does not (it drops the
-    /// connection without EGFX), so this stays off by default.
+    /// connection without EGFX). The frontend derives this from the connection's
+    /// `os` field — Windows takes the legacy path, Linux and macOS take EGFX.
     #[serde(default)]
     pub legacy_graphics: bool,
 }
@@ -163,6 +164,19 @@ pub fn run() {
             version: 3,
             description: "add_legacy_graphics",
             sql: "ALTER TABLE connections ADD COLUMN legacy_graphics INTEGER NOT NULL DEFAULT 0;",
+            kind: MigrationKind::Up,
+        },
+        // The host's operating system, picked in the connection editor. Nothing on
+        // the wire tells us this before we connect, and it decides the RDP graphics
+        // path: Windows keeps its legacy bitmap path (which it renders correctly and
+        // cheaply), everything else needs the Graphics Pipeline. `legacy_graphics` is
+        // derived from it and kept in sync, so it stays the single knob `rdp.rs` reads.
+        Migration {
+            version: 4,
+            description: "add_os",
+            sql: "ALTER TABLE connections ADD COLUMN os TEXT NOT NULL DEFAULT 'windows';
+        UPDATE connections SET os = 'linux' WHERE protocol = 'vnc';
+        UPDATE connections SET legacy_graphics = CASE WHEN os = 'windows' THEN 1 ELSE 0 END;",
             kind: MigrationKind::Up,
         },
     ];
