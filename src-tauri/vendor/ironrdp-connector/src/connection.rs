@@ -311,6 +311,11 @@ impl Sequence for ClientConnector {
                     security_protocol.insert(nego::SecurityProtocol::HYBRID | nego::SecurityProtocol::HYBRID_EX);
                 }
 
+                // PATCH (Control Desktop): see `Config::enable_rdstls`.
+                if self.config.enable_rdstls {
+                    security_protocol.insert(nego::SecurityProtocol::RDSTLS);
+                }
+
                 if security_protocol.is_standard_rdp_security() {
                     return Err(reason_err!("Initiation", "standard RDP security is not supported",));
                 }
@@ -887,8 +892,18 @@ fn create_gcc_blocks<'a>(
         } else {
             Some(ClientNetworkData { channels })
         },
-        // TODO(#139): support for Some(ClientClusterData { flags: RedirectionFlags::REDIRECTION_SUPPORTED, redirection_version: RedirectionVersion::V4, redirected_session_id: 0, }),
-        cluster: None,
+        // PATCH (Control Desktop): advertise Server Redirection support, as mstsc and
+        // FreeRDP always do, and echo the SessionID after a redirect. Upstream sends
+        // nothing here (TODO #139). The redirect itself is handled by the caller.
+        cluster: Some(gcc::ClientClusterData {
+            flags: if config.redirected_session_id.is_some() {
+                gcc::RedirectionFlags::REDIRECTION_SUPPORTED | gcc::RedirectionFlags::REDIRECTED_SESSION_FIELD_VALID
+            } else {
+                gcc::RedirectionFlags::REDIRECTION_SUPPORTED
+            },
+            redirection_version: gcc::RedirectionVersion::V4,
+            redirected_session_id: config.redirected_session_id.unwrap_or(0),
+        }),
         monitor: None,
         // PATCH (Control Desktop): do NOT request the MCS message channel.
         //

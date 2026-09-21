@@ -204,6 +204,19 @@ pub struct Config {
     /// server that sees it stops using the legacy path entirely, which is not always
     /// what we want. Remove once upstream exposes an equivalent knob.
     pub enable_egfx: bool,
+    /// PATCH (Control Desktop): request PROTOCOL_RDSTLS ([MS-RDPBCGR] 5.4.5.3).
+    ///
+    /// Used when reconnecting after a Server Redirection PDU whose password is
+    /// public-key encrypted: the client cannot decrypt it, so it hands the blob back
+    /// to the target server over RDSTLS instead of running CredSSP. This is how
+    /// `gnome-remote-desktop` Remote Login moves a client between sessions. The
+    /// connector only negotiates the protocol; the caller runs the RDSTLS exchange
+    /// on the TLS stream between the security upgrade and `connect_finalize`.
+    pub enable_rdstls: bool,
+    /// PATCH (Control Desktop): the SessionID of the Server Redirection PDU that
+    /// led to this connection, sent back in the Client Cluster Data. Upstream sends
+    /// no cluster data at all, so it never advertises redirection support.
+    pub redirected_session_id: Option<u32>,
     pub keyboard_type: gcc::KeyboardType,
     pub keyboard_subtype: u32,
     pub keyboard_functional_keys_count: u32,

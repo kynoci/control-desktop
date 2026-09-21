@@ -30,6 +30,8 @@ use ironrdp::dvc::DrdynvcClient;
 use ironrdp::graphics::image_processing::PixelFormat;
 use ironrdp::input::{Database, MouseButton, MousePosition, Operation, Scancode, WheelRotations};
 use ironrdp::pdu::geometry::InclusiveRectangle;
+use ironrdp::pdu::nego::NegoRequestData;
+use ironrdp::pdu::Action;
 use ironrdp::session::image::DecodedImage;
 use ironrdp::session::{fast_path, ActiveStage, ActiveStageBuilder, ActiveStageOutput};
 use ironrdp_bulk::BulkCompressor;
@@ -38,6 +40,7 @@ use ironrdp_tokio::{single_sequence_step_read, FramedWrite as _, TokioFramed};
 
 use crate::clipboard::{advertise_text, LocalClipboard, WebClipboardBackend};
 use crate::egfx::EgfxHandler;
+use crate::redirect::{parse_redirect_frame, rdstls_authenticate, Redirect};
 use crate::ConnectRequest;
 
 // --- Channel wire format (raw bytes, little-endian) ----------------------------
@@ -276,20 +279,80 @@ async fn run_session(
     mut clip_rx: mpsc::UnboundedReceiver<ClipboardMessage>,
     cancel: CancellationToken,
 ) -> Result<(), String> {
-    // Some servers — notably GNOME Remote Desktop in "Remote Login" mode — drop
-    // the connection right after authentication (ServerDeactivateAll + an MCS
-    // Disconnect Ultimatum) as part of a session handover, expecting the client to
-    // reconnect. mstsc does this transparently; mirror it with a bounded retry.
+    // GNOME Remote Login sends a Server Redirection PDU twice — system daemon to
+    // login screen, login screen to the user's session — and each one means a
+    // fresh connection. The bound only stops a server that redirects forever.
+    const MAX_REDIRECTS: u32 = 4;
+    let mut redirect: Option<Redirect> = None;
+    for hop in 0..=MAX_REDIRECTS {
+        let Some((framed, result)) = connect_with_retry(
+            &req,
+            &password,
+            redirect.as_ref(),
+            width,
+            height,
+            &on_frame,
+            &clip_local,
+            &clip_tx,
+            &cancel,
+        )
+        .await?
+        else {
+            return Ok(());
+        };
+        match run_active(framed, result, &on_frame, &mut input_rx, &mut resize_rx, &mut clip_rx, &cancel).await? {
+            None => return Ok(()),
+            Some(next) => {
+                log::info!("rdp: server redirection {} received: {next:?}", hop + 1);
+                if next.flags & 0x1 != 0 {
+                    // A target address is the server's view of the network; behind
+                    // NAT (a router port forward) it is unreachable, so reconnect to
+                    // the host and port the user entered, as the routing token
+                    // already tells the server which session to hand us.
+                    log::info!("rdp: ignoring redirect target address; reconnecting to {}:{}", req.host, req.port);
+                }
+                let _ = on_frame.send(status_msg("Server redirected the session, reconnecting..."));
+                redirect = Some(next);
+            }
+        }
+    }
+    Err(format!("server redirected the session more than {MAX_REDIRECTS} times"))
+}
+
+/// Connect (or reconnect after a redirect), retrying the post-auth "handoff
+/// disconnect". `Ok(None)` means the session was cancelled while connecting.
+#[allow(clippy::too_many_arguments)]
+async fn connect_with_retry(
+    req: &ConnectRequest,
+    password: &str,
+    redirect: Option<&Redirect>,
+    width: u16,
+    height: u16,
+    on_frame: &Channel<InvokeResponseBody>,
+    clip_local: &LocalClipboard,
+    clip_tx: &mpsc::UnboundedSender<ClipboardMessage>,
+    cancel: &CancellationToken,
+) -> Result<
+    Option<(
+        TokioFramed<tokio_rustls::client::TlsStream<TcpStream>>,
+        ConnectionResult,
+    )>,
+    String,
+> {
+    // Some servers drop the connection right after authentication
+    // (ServerDeactivateAll + an MCS Disconnect Ultimatum) as part of a session
+    // handover, expecting the client to reconnect. mstsc does this transparently;
+    // mirror it with a bounded retry.
     const MAX_ATTEMPTS: u32 = 6;
-    let (upgraded_framed, connection_result) = {
+    let pair = {
         let mut established = None;
         let mut last_err = String::new();
         for attempt in 1..=MAX_ATTEMPTS {
             if cancel.is_cancelled() {
-                return Ok(());
+                return Ok(None);
             }
             let clip_backend = WebClipboardBackend::new(clip_local.clone(), clip_tx.clone(), on_frame.clone());
-            match establish(&req, &password, width, height, clip_backend, &on_frame).await {
+            match establish(req, password, redirect, width, height, clip_backend, on_frame).await {
                 Ok(pair) => {
                     established = Some(pair);
                     break;
@@ -322,7 +385,20 @@ async fn run_session(
             }
         }
     };
+    Ok(Some(pair))
+}
 
+/// Drive one connected session until it ends. `Ok(Some(redirect))` means the
+/// server asked the client to reconnect elsewhere (Server Redirection).
+async fn run_active(
+    upgraded_framed: TokioFramed<tokio_rustls::client::TlsStream<TcpStream>>,
+    connection_result: ConnectionResult,
+    on_frame: &Channel<InvokeResponseBody>,
+    input_rx: &mut mpsc::UnboundedReceiver<Vec<Operation>>,
+    resize_rx: &mut mpsc::UnboundedReceiver<(u16, u16)>,
+    clip_rx: &mut mpsc::UnboundedReceiver<ClipboardMessage>,
+    cancel: &CancellationToken,
+) -> Result<Option<Redirect>, String> {
     let ConnectionResult {
         io_channel_id,
         user_channel_id,
@@ -431,9 +507,22 @@ async fn run_session(
                     Ok(v) => v,
                     Err(e) => return Err(format!("connection lost: {e}")),
                 };
-                active_stage
-                    .process(&mut image, action, &payload)
-                    .map_err(|e| format!("frame decode failed: {e}"))?
+                // `ironrdp-session` cannot decode a Server Redirection PDU (it
+                // rejects the share control type), so catch it first.
+                if action == Action::X224 {
+                    match parse_redirect_frame(&payload) {
+                        Some(Ok(redirect)) => return Ok(Some(redirect)),
+                        Some(Err(e)) => return Err(format!("server redirection failed: {e}")),
+                        None => {}
+                    }
+                }
+                active_stage.process(&mut image, action, &payload).map_err(|e| {
+                    // The error alone ("decode error") says nothing about what the
+                    // server sent; the head of the PDU does.
+                    let head = &payload[..payload.len().min(48)];
+                    log::warn!("rdp: undecodable {action:?} PDU ({} bytes): {head:02x?}", payload.len());
+                    format!("frame decode failed: {e}")
+                })?
             }
         };
 
@@ -511,7 +600,7 @@ async fn run_session(
         }
     }
 
-    Ok(())
+    Ok(None)
 }
 
 /// Run the Deactivation-Reactivation sequence after a `ServerDeactivateAll`, then
@@ -612,9 +701,15 @@ fn dispatch_clipboard(stage: &mut ActiveStage, msg: ClipboardMessage) -> Result<
 /// One full connect attempt: TCP → RDP negotiation → TLS → CredSSP/NLA. Returns
 /// the upgraded framed stream plus the negotiated connection result, ready for
 /// the active session. Kept separate from `run_session` so it can be retried.
+///
+/// After a Server Redirection, `redirect` carries what the server said to come
+/// back with: the routing token always, and either replacement credentials for
+/// CredSSP or — when the password is encrypted to the target — an RDSTLS
+/// exchange in place of CredSSP.
 async fn establish(
     req: &ConnectRequest,
     password: &str,
+    redirect: Option<&Redirect>,
     width: u16,
     height: u16,
     clipboard_backend: Box<dyn ironrdp::cliprdr::backend::CliprdrBackend>,
@@ -630,7 +725,23 @@ async fn establish(
     // (gnome-remote-desktop), and optional for Windows, which can stream legacy
     // surface commands that ironrdp-session decodes itself. See `legacy_graphics`.
     let enable_egfx = !req.legacy_graphics;
-    let config = build_config(&req.username, password.to_owned(), width, height, enable_egfx);
+    let use_rdstls = redirect.is_some_and(Redirect::needs_rdstls);
+    let username = redirect
+        .and_then(|r| r.username.clone())
+        .unwrap_or_else(|| req.username.clone());
+    let password = redirect
+        .and_then(Redirect::plain_password)
+        .unwrap_or_else(|| password.to_owned());
+    let mut config = build_config(&username, password, width, height, enable_egfx);
+    if let Some(r) = redirect {
+        config.request_data = r.routing_token().map(NegoRequestData::routing_token);
+        config.redirected_session_id = Some(r.session_id);
+        config.domain = r.domain.clone().filter(|d| !d.is_empty());
+        if use_rdstls {
+            config.enable_credssp = false;
+            config.enable_rdstls = true;
+        }
+    }
 
     // Each step below can stall for seconds on a slow or unreachable host, so
     // report them as they start — otherwise the UI just says "connecting".
@@ -671,17 +782,22 @@ async fn establish(
     // The connection must now be wrapped in TLS before CredSSP/NLA continues.
     let _ = on_frame.send(status_msg("Securing connection (TLS)..."));
     let initial_stream = framed.into_inner_no_leftover();
-    let (tls_stream, server_public_key) = tls_upgrade(initial_stream, &req.host)
+    let (mut tls_stream, server_public_key) = tls_upgrade(initial_stream, &req.host)
         .await
         .map_err(|e| format!("TLS upgrade failed: {e}"))?;
 
     let upgraded = ironrdp_tokio::mark_as_upgraded(should_upgrade, &mut connector);
+    if let Some(r) = redirect.filter(|_| use_rdstls) {
+        // RDSTLS replaces CredSSP: the connector skips NLA for this protocol, and
+        // the exchange runs on the raw TLS stream before any framed RDP traffic.
+        let _ = on_frame.send(status_msg("Handing over to the redirected session (RDSTLS)..."));
+        rdstls_authenticate(&mut tls_stream, r).await?;
+    }
     let mut upgraded_framed = TokioFramed::new(tls_stream);
 
-    let _ = on_frame.send(status_msg(&format!(
-        "Signing in as {} (NLA/CredSSP)...",
-        req.username
-    )));
+    if !use_rdstls {
+        let _ = on_frame.send(status_msg(&format!("Signing in as {username} (NLA/CredSSP)...")));
+    }
     let mut network_client = NoKdcNetworkClient;
     let connection_result = ironrdp_tokio::connect_finalize(
         upgraded,
@@ -1035,6 +1151,9 @@ fn build_config(username: &str, password: String, width: u16, height: u16, enabl
         // Advertising EGFX makes a Windows server abandon the legacy path entirely,
         // so a connection that asked for legacy graphics must not claim it.
         enable_egfx,
+        // Both set by `establish` only when reconnecting after a Server Redirection.
+        enable_rdstls: false,
+        redirected_session_id: None,
         dig_product_id: String::new(),
         desktop_size: connector::DesktopSize {
             width: width.max(200),

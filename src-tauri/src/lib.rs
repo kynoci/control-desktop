@@ -4,6 +4,7 @@ use tauri_plugin_sql::{Migration, MigrationKind};
 mod clipboard;
 mod egfx;
 mod rdp;
+mod redirect;
 mod vnc;
 
 const KEYRING_SERVICE: &str = "com.kynoci.remote";
