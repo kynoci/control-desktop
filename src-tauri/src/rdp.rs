@@ -775,9 +775,37 @@ async fn establish(
         .with_static_channel(cliprdr);
 
     let _ = on_frame.send(status_msg("Negotiating RDP protocol..."));
-    let should_upgrade = ironrdp_tokio::connect_begin(&mut framed, &mut connector)
+    // A healthy server answers the Connection Request immediately. A wedged
+    // gnome-remote-desktop daemon can leave it unanswered forever (the kernel
+    // still completes the TCP handshake), which otherwise hangs the tab on this
+    // status with no error.
+    const NEGOTIATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+    let should_upgrade = tokio::time::timeout(NEGOTIATION_TIMEOUT, ironrdp_tokio::connect_begin(&mut framed, &mut connector))
         .await
-        .map_err(|e| format!("RDP negotiation failed: {e}"))?;
+        .map_err(|_| {
+            format!(
+                "the server accepted the connection but did not answer the RDP request within {}s. \
+                 Its RDP service is likely stuck — on Ubuntu run `sudo systemctl restart gnome-remote-desktop`; \
+                 on Windows restart the Remote Desktop Services service or reboot.",
+                NEGOTIATION_TIMEOUT.as_secs()
+            )
+        })?
+        .map_err(|e| {
+            let e = e.to_string();
+            // IronRDP reports a server that hangs up without answering as
+            // "read frame by hint … custom error". Seen when gnome-remote-desktop's
+            // daemon wedged after an internal assertion: it still accepted TCP but
+            // closed every connection unlogged until restarted.
+            if e.contains("read frame by hint") {
+                format!(
+                    "the server accepted the connection but closed it without answering the RDP request. \
+                     Its RDP service is likely stuck — on Ubuntu run `sudo systemctl restart gnome-remote-desktop`; \
+                     on Windows restart the Remote Desktop Services service or reboot. ({e})"
+                )
+            } else {
+                format!("RDP negotiation failed: {e}")
+            }
+        })?;
 
     // The connection must now be wrapped in TLS before CredSSP/NLA continues.
     let _ = on_frame.send(status_msg("Securing connection (TLS)..."));

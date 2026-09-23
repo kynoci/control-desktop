@@ -303,6 +303,9 @@ async fn run_session(
     let mut fb_w: u16 = 0;
     let mut fb_h: u16 = 0;
     let mut ptr = Pointer::default();
+    // One-shot diagnostic: tells "the server sent us nothing" apart from
+    // "the server sent pixels we failed to draw" when the canvas stays black.
+    let mut first_paint = true;
 
     let mut tick = tokio::time::interval(FRAME_INTERVAL);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -330,7 +333,9 @@ async fn run_session(
                 loop {
                     match client.poll_event().await {
                         Ok(Some(event)) => {
-                            handle_event(event, &on_frame, &mut fb, &mut fb_w, &mut fb_h)?;
+                            handle_event(
+                                event, &on_frame, &mut fb, &mut fb_w, &mut fb_h, &mut first_paint,
+                            )?;
                         }
                         Ok(None) => break,
                         Err(e) => return Err(format!("connection lost: {e}")),
@@ -356,6 +361,7 @@ fn handle_event(
     fb: &mut Vec<u8>,
     fb_w: &mut u16,
     fb_h: &mut u16,
+    first_paint: &mut bool,
 ) -> Result<(), String> {
     match event {
         VncEvent::SetResolution(screen) => {
@@ -366,7 +372,23 @@ fn handle_event(
             send_init(on_frame, screen.width, screen.height)?;
             log::info!("vnc: framebuffer {}x{}", screen.width, screen.height);
         }
-        VncEvent::RawImage(rect, data) => {
+        VncEvent::RawImage(rect, mut data) => {
+            if std::mem::take(first_paint) {
+                log::info!(
+                    "vnc: first pixel update {}x{} at ({},{}), {} bytes",
+                    rect.width, rect.height, rect.x, rect.y, data.len()
+                );
+            }
+            // RFB has no alpha channel. In a 32bpp/depth-24 format the fourth
+            // byte is padding, and Xvnc leaves it zero — the Raw decoder copies
+            // wire bytes verbatim, so every pixel would reach putImageData fully
+            // transparent and the canvas would stay black. Servers that speak
+            // ZRLE/TRLE never hit this (those codecs build pixels from a
+            // [255; 4] buffer), which is why only Raw-only servers like
+            // TightVNC 1.3.10 showed it. Forcing alpha is idempotent.
+            for px in data.chunks_exact_mut(4) {
+                px[3] = 255;
+            }
             blit(fb, *fb_w, *fb_h, rect.x, rect.y, rect.width, rect.height, &data);
             send_rect(on_frame, rect.x, rect.y, rect.width, rect.height, &data)?;
         }

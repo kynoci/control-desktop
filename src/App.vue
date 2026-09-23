@@ -1222,18 +1222,16 @@ onMounted(async () => {
 <template>
   <div class="root" :class="{ fullscreen: isFullscreen }">
     <div class="titlebar" data-tauri-drag-region>
-      <div class="brand" data-tauri-drag-region>
-        <img src="/app-icon.png" class="brand-icon" alt="" data-tauri-drag-region />
-        <span class="brand-title" data-tauri-drag-region>Control Desktop</span>
-      </div>
+      <button
+        class="brand"
+        :class="{ active: activeTab === 'home' }"
+        title="Connections"
+        @click="activeTab = 'home'"
+      >
+        <img src="/app-icon.png" class="brand-icon" alt="" />
+        <span class="brand-title">Control Desktop</span>
+      </button>
       <nav class="tabs" @wheel.prevent="onTabsWheel">
-        <button
-          class="tab"
-          :class="{ active: activeTab === 'home' }"
-          @click="activeTab = 'home'"
-        >
-          Connections
-        </button>
         <button
           v-for="s in sessions"
           :key="s.id"
@@ -1651,9 +1649,17 @@ body, html, #app { margin: 0; height: 100%; }
   align-items: center;
   gap: 8px;
   flex: 0 0 auto;
+  align-self: stretch;
   padding: 0 12px;
   user-select: none;
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  cursor: pointer;
+  font: inherit;
 }
+.brand:hover,
+.brand.active { background: rgba(255, 255, 255, 0.08); }
 .brand-icon { width: 18px; height: 18px; }
 .brand-title {
   font-size: 13px;
