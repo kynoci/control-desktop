@@ -246,6 +246,60 @@ const treeRows = computed(() => {
   return rows;
 });
 
+// The ⋯ menu on a sidebar row. Positioned `fixed` from the button's rect so the
+// scrolling tree can't clip it; any click elsewhere closes it.
+const rowMenu = ref<{ item: Item; x: number; y: number } | null>(null);
+
+// In-app replacement for window.confirm(), whose native dialog is titled
+// "localhost:1420 says" and can't be styled. Resolves true on confirm.
+type ConfirmOpts = { title: string; message: string; confirmLabel?: string; danger?: boolean };
+const confirmDialog = ref<(ConfirmOpts & { resolve: (ok: boolean) => void }) | null>(null);
+const confirmBtn = ref<HTMLButtonElement | null>(null);
+function askConfirm(opts: ConfirmOpts): Promise<boolean> {
+  confirmDialog.value?.resolve(false);
+  return new Promise((resolve) => {
+    confirmDialog.value = { ...opts, resolve };
+    nextTick(() => confirmBtn.value?.focus());
+  });
+}
+function closeConfirm(ok: boolean) {
+  const d = confirmDialog.value;
+  confirmDialog.value = null;
+  d?.resolve(ok);
+}
+function toggleRowMenu(e: MouseEvent, item: Item) {
+  if (rowMenu.value && itemKey(rowMenu.value.item) === itemKey(item)) {
+    rowMenu.value = null;
+    return;
+  }
+  const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+  rowMenu.value = { item, x: r.right, y: r.bottom + 2 };
+}
+function rowMenuEdit() {
+  const it = rowMenu.value?.item;
+  rowMenu.value = null;
+  if (!it) return;
+  if (it.kind === "folder") renameFolder(it.folder);
+  else editConn(it.conn);
+}
+function rowMenuDuplicate() {
+  const it = rowMenu.value?.item;
+  rowMenu.value = null;
+  if (it?.kind === "conn") duplicateConn(it.conn);
+}
+function rowMenuMstsc() {
+  const it = rowMenu.value?.item;
+  rowMenu.value = null;
+  if (it?.kind === "conn") connectMstsc(it.conn);
+}
+function rowMenuDelete() {
+  const it = rowMenu.value?.item;
+  rowMenu.value = null;
+  if (!it) return;
+  if (it.kind === "folder") deleteFolder(it.folder);
+  else deleteConn(it.conn);
+}
+
 // Flat "pick a folder" list for the two forms, indented to show nesting.
 const folderOptions = computed(() => {
   const out: { id: number; label: string }[] = [];
@@ -344,10 +398,15 @@ async function saveFolder() {
 async function deleteFolder(f: Folder) {
   if (!db.value) return;
   const n = folderCount(f.id);
-  const msg = n
-    ? `Delete folder "${f.name}"?\n\nIts ${n} item(s) will move to the parent folder.`
-    : `Delete folder "${f.name}"?`;
-  if (!confirm(msg)) return;
+  const ok = await askConfirm({
+    title: "Delete folder",
+    message: n
+      ? `Delete folder "${f.name}"? Its ${n} item${n === 1 ? "" : "s"} will move to the parent folder.`
+      : `Delete folder "${f.name}"?`,
+    confirmLabel: "Delete",
+    danger: true,
+  });
+  if (!ok) return;
   const parent = f.parent_id ?? null;
   try {
     await db.value.execute("UPDATE folders SET parent_id=$1 WHERE parent_id=$2", [parent, f.id]);
@@ -384,11 +443,14 @@ function loadThumbnails() {
 
 // The item being dragged (source), and where the drop would currently land.
 const dragItem = ref<{ kind: "folder" | "conn"; id: number } | null>(null);
+// Where the sidebar draws its insertion line: on which row, which edge, and at
+// which nesting depth (so the line's indent shows the level the drop lands in).
+type TreeLine = { key: string; side: "before" | "after"; depth: number };
 type DropHint =
   // `parent` is the folder the reorder happens in — the grid can only reorder
   // the folder it has open, but the sidebar tree shows several at once.
-  | { key: string; mode: "before" | "after"; target: Item; parent: number | null }
-  | { key: string; mode: "into"; folderId: number | null };
+  | { key: string; mode: "before" | "after"; target: Item; parent: number | null; line?: TreeLine }
+  | { key: string; mode: "into"; folderId: number | null; line?: TreeLine };
 const dropHint = ref<DropHint | null>(null);
 // Label + position of the ghost that follows the cursor while dragging.
 const dragGhost = ref<{ label: string; x: number; y: number } | null>(null);
@@ -399,6 +461,10 @@ let suppressClick = false;
 // Pending press: a drag only starts once the pointer has moved a few pixels,
 // so ordinary clicks still work.
 let press: { item: Item; x: number; y: number } | null = null;
+// For drags that start in the sidebar tree: the source row's depth and the
+// pointer's starting x. Tree drop levels are then relative — straight down
+// keeps the item's level, each step left/right moves one level out/in.
+let treeDragOrigin: { depth: number; x: number } | null = null;
 
 function onItemMouseDown(e: MouseEvent, i: Item) {
   // Left button only, and never when the press began on a control.
@@ -407,6 +473,10 @@ function onItemMouseDown(e: MouseEvent, i: Item) {
   // Clear any guard left over from a previous drag whose click never landed.
   suppressClick = false;
   press = { item: i, x: e.clientX, y: e.clientY };
+  const row = (e.target as HTMLElement).closest(".tree-row")
+    ? treeRows.value.find((r) => r.key === itemKey(i))
+    : undefined;
+  treeDragOrigin = row ? { depth: row.depth, x: e.clientX } : null;
   window.addEventListener("mousemove", onDragMove);
   window.addEventListener("mouseup", onDragUp);
 }
@@ -500,24 +570,34 @@ function updateDropHint(x: number, y: number) {
     return;
   }
 
-  // A sidebar row. Same idea as a card but split vertically: the middle band of
-  // a folder row means "inside", the top/bottom mean "insert above/below".
+  // A sidebar row. The middle band of a folder row means "inside"; otherwise
+  // the pointer picks the gap above or below the row, and the gap decides the
+  // level (see treeGapHint).
   if (kind === "tree") {
-    const parentRaw = el.dataset.dropParent;
-    const parent = parentRaw ? Number(parentRaw) : null;
-    const target = itemsIn(parent).find((i) => itemKey(i) === el.dataset.dropItem);
-    if (!target) {
+    const rows = treeRows.value;
+    const idx = rows.findIndex((r) => r.key === el.dataset.dropItem);
+    const row = rows[idx];
+    if (!row || row.kind !== "item") {
       dropHint.value = null;
       return;
     }
+    const target = row.item;
     const r = el.getBoundingClientRect();
     const rel = (y - r.top) / r.height;
     const self = d.kind === target.kind && d.id === target.id;
     if (target.kind === "folder" && !self && rel > 0.25 && rel < 0.75 && canMove(d, target.id)) {
       dropHint.value = { key, mode: "into", folderId: target.id };
     } else {
-      dropHint.value = { key, mode: rel < 0.5 ? "before" : "after", target, parent };
+      dropHint.value = treeGapHint(d, rel < 0.5 ? idx : idx + 1, x, el);
     }
+    return;
+  }
+
+  // The empty space below the last tree row: always the top (Home) level, at
+  // the end — dragging "out below" a nested folder should leave it.
+  if (kind === "tree-end") {
+    const n = treeRows.value.length;
+    dropHint.value = n ? treeGapHint(d, n, x, el, 0) : canMove(d, null) ? { key, mode: "into", folderId: null } : null;
     return;
   }
 
@@ -538,6 +618,103 @@ function updateDropHint(x: number, y: number) {
   const raw = el.dataset.dropFolder;
   const folderId = raw ? Number(raw) : null;
   dropHint.value = canMove(d, folderId) ? { key, mode: "into", folderId } : null;
+}
+
+// Sidebar row geometry, mirrored from the CSS: 10px row padding, then one
+// 14px indent + 6px gap per level, then the 14px caret column.
+const TREE_PAD = 10;
+const TREE_STEP = 20;
+
+// Resolve a drop into the gap *before* treeRows[gap]. A gap at the bottom of a
+// folder is ambiguous — "last inside the folder" or "after the folder" — so
+// every depth between the next row's and the previous row's is allowed, and
+// the pointer's x picks one: further right means deeper.
+function treeGapHint(
+  d: { kind: string; id: number },
+  gap: number,
+  x: number,
+  rowEl: HTMLElement,
+  forceDepth?: number,
+): DropHint | null {
+  const rows = treeRows.value;
+  const prev = rows[gap - 1];
+  const next = rows[gap];
+  // Deepest level: inside prev's folder if it's expanded, else prev's level.
+  const maxDepth = !prev
+    ? 0
+    : prev.kind === "item" && prev.item.kind === "folder" && prev.expanded
+      ? prev.depth + 1
+      : prev.depth;
+  const minDepth = next ? Math.min(next.depth, maxDepth) : 0;
+  let pointed: number;
+  if (treeDragOrigin) {
+    pointed = treeDragOrigin.depth + Math.round((x - treeDragOrigin.x) / TREE_STEP);
+  } else {
+    // Dragged in from the grid: no origin, so use the absolute position. The
+    // content of a row at depth n starts after n+1 indents and the caret.
+    const left = rowEl.getBoundingClientRect().left;
+    pointed = Math.floor((x - left - TREE_PAD) / TREE_STEP) - 1;
+  }
+  const depth = Math.max(minDepth, Math.min(maxDepth, forceDepth ?? pointed));
+
+  const line: TreeLine = next
+    ? { key: next.key, side: "before", depth }
+    : { key: prev!.key, side: "after", depth };
+  const key = "tree:" + line.key;
+
+  // Landing at the next row's level means "just before it".
+  if (next && next.depth === depth) {
+    if (next.kind === "empty")
+      return canMove(d, next.folderId) ? { key, mode: "into", folderId: next.folderId, line } : null;
+    return canMove(d, next.parent)
+      ? { key, mode: "before", target: next.item, parent: next.parent, line }
+      : null;
+  }
+  // Otherwise "just after" whichever row above sits at that level — prev itself
+  // or one of its ancestors. Rows are in pre-order, so scan upwards.
+  for (let i = gap - 1; i >= 0; i--) {
+    const r = rows[i];
+    if (r.depth > depth) continue;
+    if (r.depth < depth) {
+      // Reached the parent folder first: it's expanded with nothing at this
+      // level below the gap, so this means "into it".
+      if (r.kind !== "item" || r.item.kind !== "folder") return null;
+      return canMove(d, r.item.id) ? { key, mode: "into", folderId: r.item.id, line } : null;
+    }
+    if (r.kind === "empty")
+      return canMove(d, r.folderId) ? { key, mode: "into", folderId: r.folderId, line } : null;
+    return canMove(d, r.parent)
+      ? { key, mode: "after", target: r.item, parent: r.parent, line }
+      : null;
+  }
+  return null;
+}
+
+// Tree rows draw their indicator from the hint's `line` when it has one, so the
+// bar can sit on a different row than the drop target and carry its depth.
+function treeDropClass(rowKey: string) {
+  const h = dropHint.value;
+  if (!h) return "";
+  if (h.line) return h.line.key === rowKey ? `drop-${h.line.side}` : "";
+  return h.key === "tree:" + rowKey ? `drop-${h.mode}` : "";
+}
+// The folder a tree line drop lands in (null = Home), for the label on the
+// line and the tint on that folder's row — the indent alone is a subtle cue.
+const treeDropFolder = computed<number | null | undefined>(() => {
+  const h = dropHint.value;
+  if (!h?.line) return undefined;
+  return h.mode === "into" ? h.folderId : h.parent;
+});
+const treeDropLabel = computed(() => {
+  const f = treeDropFolder.value;
+  if (f === undefined) return "";
+  if (f === null) return "Home";
+  return folders.value.find((x) => x.id === f)?.name ?? "";
+});
+function treeDropStyle(rowKey: string) {
+  const l = dropHint.value?.line;
+  if (!l || l.key !== rowKey) return undefined;
+  return { "--drop-indent": `${TREE_PAD + TREE_STEP * (l.depth + 1)}px` };
 }
 
 // Closest card to the cursor within the same row band, as an insertion point.
@@ -717,9 +894,45 @@ async function saveDraft() {
   }
 }
 
+// Copy a connection, keychain password included, into the slot right after
+// the original.
+async function duplicateConn(c: Connection) {
+  if (!db.value) return;
+  const folder = c.folder_id ?? null;
+  const os = c.os ?? "windows";
+  try {
+    const res = await db.value.execute(
+      "INSERT INTO connections (name, host, port, username, protocol, folder_id, sort_order, os, legacy_graphics) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+      [`${c.name} (copy)`, c.host, c.port, c.username, c.protocol, folder, itemsIn(folder).length, os, legacyGraphicsFor(os) ? 1 : 0],
+    );
+    const id = Number(res.lastInsertId);
+    const password = await invoke<string | null>("get_password", { connectionId: c.id });
+    if (password) await invoke("save_password", { connectionId: id, password });
+    await loadAll();
+    const list = itemsIn(folder);
+    const from = list.findIndex((i) => i.kind === "conn" && i.id === id);
+    const after = list.findIndex((i) => i.kind === "conn" && i.id === c.id);
+    if (from !== -1 && after !== -1) {
+      const [moved] = list.splice(from, 1);
+      list.splice(after + 1, 0, moved);
+      await persistOrder(list);
+      await loadAll();
+    }
+    status.value = "Duplicated";
+  } catch (e) {
+    status.value = `Duplicate failed: ${e}`;
+  }
+}
+
 async function deleteConn(c: Connection) {
   if (!db.value) return;
-  if (!confirm(`Delete "${c.name}"?`)) return;
+  const ok = await askConfirm({
+    title: "Delete connection",
+    message: `Delete "${c.name}"? Its saved password will be removed too.`,
+    confirmLabel: "Delete",
+    danger: true,
+  });
+  if (!ok) return;
   try {
     await db.value.execute("DELETE FROM connections WHERE id=$1", [c.id]);
     await invoke("delete_password", { connectionId: c.id });
@@ -1197,8 +1410,14 @@ onMounted(async () => {
   // Abandon an in-flight card drag if the window loses focus or Esc is pressed.
   window.addEventListener("blur", cancelDrag);
   window.addEventListener("keydown", (e) => {
-    if (e.key === "Escape") cancelDrag();
+    if (e.key === "Escape") {
+      cancelDrag();
+      rowMenu.value = null;
+      if (confirmDialog.value) closeConfirm(false);
+    }
   });
+  window.addEventListener("click", () => (rowMenu.value = null));
+  window.addEventListener("blur", () => (rowMenu.value = null));
   // When the app regains focus (e.g. after copying in another app), prime the
   // active session's remote clipboard with the local clipboard contents.
   window.addEventListener("focus", () => {
@@ -1271,12 +1490,13 @@ onMounted(async () => {
       </div>
       <!-- Folder tree. Rows are pre-flattened with a depth, so no recursive
            component is needed; folders are also drop targets for moves. -->
-      <ul class="conn-list tree">
+      <ul class="conn-list tree" data-drop-key="tree:end" data-drop-kind="tree-end">
         <li
           class="tree-row root-row"
           :class="{
             active: currentFolder === null,
             'drop-into': dropHint?.key === 'tree:root',
+            'drop-parent': treeDropFolder === null,
           }"
           data-drop-key="tree:root"
           data-drop-kind="folder"
@@ -1294,9 +1514,11 @@ onMounted(async () => {
               {
                 'is-folder': row.item.kind === 'folder',
                 active: row.item.kind === 'folder' && currentFolder === row.item.id,
+                'drop-parent': row.item.kind === 'folder' && treeDropFolder === row.item.id,
               },
-              dropClassFor('tree:' + row.key),
+              treeDropClass(row.key),
             ]"
+            :style="treeDropStyle(row.key)"
             :title="
               row.item.kind === 'folder'
                 ? `Open ${row.item.name}`
@@ -1305,7 +1527,6 @@ onMounted(async () => {
             :data-drop-key="'tree:' + row.key"
             data-drop-kind="tree"
             :data-drop-item="row.key"
-            :data-drop-parent="row.parent ?? ''"
             :data-drop-folder="row.item.kind === 'folder' ? row.item.id : undefined"
             @mousedown="(e) => onItemMouseDown(e, row.item)"
             @click="onItemClick(row.item)"
@@ -1335,12 +1556,28 @@ onMounted(async () => {
                 </span>
               </span>
             </template>
+            <button
+              class="tree-more"
+              :class="{ open: rowMenu && itemKey(rowMenu.item) === row.key }"
+              title="More actions"
+              @click.stop="(e) => toggleRowMenu(e, row.item)"
+            >
+              ⋯
+            </button>
+            <span
+              v-if="dropHint?.line?.key === row.key"
+              class="drop-label"
+              :class="dropHint.line.side"
+            >
+              → {{ treeDropLabel }}
+            </span>
           </li>
           <!-- Also a drop target: dropping here fills the empty folder. -->
           <li
             v-else
             class="tree-row tree-empty"
-            :class="dropClassFor('tree:' + row.key)"
+            :class="treeDropClass(row.key)"
+            :style="treeDropStyle(row.key)"
             :data-drop-key="'tree:' + row.key"
             data-drop-kind="folder"
             :data-drop-folder="row.folderId"
@@ -1348,6 +1585,13 @@ onMounted(async () => {
             <span v-for="n in row.depth + 1" :key="n" class="tree-indent"></span>
             <span class="tree-caret"></span>
             <span>Empty</span>
+            <span
+              v-if="dropHint?.line?.key === row.key"
+              class="drop-label"
+              :class="dropHint.line.side"
+            >
+              → {{ treeDropLabel }}
+            </span>
           </li>
         </template>
         <li v-if="treeRows.length === 0" class="empty">
@@ -1355,6 +1599,44 @@ onMounted(async () => {
         </li>
       </ul>
     </aside>
+
+    <!-- Shared ⋯ menu for sidebar rows and grid cards. Outside the sidebar so
+         it still shows when the sidebar is collapsed. -->
+    <div
+      v-if="rowMenu"
+      class="row-menu"
+      :style="{ left: rowMenu.x + 'px', top: rowMenu.y + 'px' }"
+      @click.stop
+    >
+      <button
+        v-if="rowMenu.item.kind === 'conn' && rowMenu.item.conn.protocol === 'rdp'"
+        @click="rowMenuMstsc"
+      >
+        🖥 Open with Windows RDP
+      </button>
+      <button @click="rowMenuEdit">
+        ✎ {{ rowMenu.item.kind === "folder" ? "Rename / move" : "Edit" }}
+      </button>
+      <button v-if="rowMenu.item.kind === 'conn'" @click="rowMenuDuplicate">⧉ Duplicate</button>
+      <button class="danger" @click="rowMenuDelete">🗑 Delete</button>
+    </div>
+
+    <div v-if="confirmDialog" class="modal-backdrop" @mousedown.self="closeConfirm(false)">
+      <div class="modal" role="alertdialog" aria-modal="true" :aria-label="confirmDialog.title">
+        <h3>{{ confirmDialog.title }}</h3>
+        <p>{{ confirmDialog.message }}</p>
+        <div class="modal-actions">
+          <button @click="closeConfirm(false)">Cancel</button>
+          <button
+            ref="confirmBtn"
+            :class="confirmDialog.danger ? 'danger-solid' : 'primary'"
+            @click="closeConfirm(true)"
+          >
+            {{ confirmDialog.confirmLabel ?? "OK" }}
+          </button>
+        </div>
+      </div>
+    </div>
 
     <main class="main" :class="{ shifted: sidebarCollapsed }">
       <section v-if="editing" class="form">
@@ -1487,9 +1769,8 @@ onMounted(async () => {
           >
             <template v-if="it.kind === 'folder'">
               <span class="conn-card-proto folder">FOLDER</span>
-              <div class="conn-card-actions">
-                <button class="icon-btn" title="Rename / move" @click.stop="renameFolder(it.folder)">✎</button>
-                <button class="icon-btn danger" title="Delete folder" @click.stop="deleteFolder(it.folder)">🗑</button>
+              <div class="conn-card-actions" :class="{ open: rowMenu && itemKey(rowMenu.item) === itemKey(it) }">
+                <button class="icon-btn" title="More actions" @click.stop="(e) => toggleRowMenu(e, it)">⋯</button>
               </div>
               <div class="conn-card-thumb folder-thumb">
                 <span class="folder-glyph">📁</span>
@@ -1505,10 +1786,8 @@ onMounted(async () => {
               <span class="conn-card-proto" :class="it.conn.protocol">
                 {{ it.conn.protocol.toUpperCase() }}
               </span>
-              <div class="conn-card-actions">
-                <button v-if="it.conn.protocol === 'rdp'" class="icon-btn" title="Open with Windows RDP" @click.stop="connectMstsc(it.conn)">🖥</button>
-                <button class="icon-btn" title="Edit" @click.stop="editConn(it.conn)">✎</button>
-                <button class="icon-btn danger" title="Delete" @click.stop="deleteConn(it.conn)">🗑</button>
+              <div class="conn-card-actions" :class="{ open: rowMenu && itemKey(rowMenu.item) === itemKey(it) }">
+                <button class="icon-btn" title="More actions" @click.stop="(e) => toggleRowMenu(e, it)">⋯</button>
               </div>
               <div class="conn-card-thumb">
                 <img v-if="thumbnails[it.id]" :src="thumbnails[it.id]" alt="" draggable="false" />
@@ -1908,7 +2187,8 @@ body, html, #app { margin: 0; height: 100%; }
 .tree-row.drop-after::after {
   content: "";
   position: absolute;
-  left: 8px;
+  /* Indented to the level the drop lands in (set per row by treeDropStyle). */
+  left: var(--drop-indent, 8px);
   right: 8px;
   height: 3px;
   border-radius: 2px;
@@ -1916,6 +2196,111 @@ body, html, #app { margin: 0; height: 100%; }
 }
 .tree-row.drop-before::after { top: -2px; }
 .tree-row.drop-after::after { bottom: -2px; }
+/* A ring at the start of the line marks exactly where the level begins. */
+.tree-row.drop-before::before,
+.tree-row.drop-after::before {
+  content: "";
+  position: absolute;
+  z-index: 1;
+  left: calc(var(--drop-indent, 8px) - 4px);
+  width: 6px;
+  height: 6px;
+  border: 2px solid #2563eb;
+  border-radius: 50%;
+  background: #fff;
+}
+.tree-row.drop-before::before { top: -5px; }
+.tree-row.drop-after::before { bottom: -5px; }
+/* The folder the drop lands in, tinted so the destination reads at a glance. */
+.tree-row.drop-parent { background: #eef4ff; box-shadow: inset 3px 0 0 #2563eb; }
+/* "→ folder" tag riding on the insertion line, at its right end. */
+.drop-label {
+  position: absolute;
+  right: 12px;
+  z-index: 2;
+  padding: 1px 7px;
+  font-size: 11px;
+  font-weight: 600;
+  font-style: normal;
+  line-height: 16px;
+  color: #fff;
+  background: #2563eb;
+  border-radius: 8px;
+  pointer-events: none;
+  white-space: nowrap;
+}
+.drop-label.before { top: -9px; }
+.drop-label.after { bottom: -9px; }
+/* ⋯ button: only shown on hover (or while its menu is open) to keep rows quiet. */
+.tree-more {
+  flex: 0 0 auto;
+  margin-left: auto;
+  padding: 0 6px;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: #666;
+  font-size: 16px;
+  line-height: 20px;
+  cursor: pointer;
+  visibility: hidden;
+}
+.tree-row:hover .tree-more,
+.tree-more.open { visibility: visible; }
+.tree-more:hover,
+.tree-more.open { background: rgba(128, 128, 128, 0.2); }
+.row-menu {
+  position: fixed;
+  transform: translateX(-100%);
+  z-index: 1000;
+  min-width: 140px;
+  padding: 4px;
+  background: #fff;
+  border: 1px solid rgba(0, 0, 0, 0.12);
+  border-radius: 6px;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.15);
+  display: flex;
+  flex-direction: column;
+}
+.row-menu button {
+  text-align: left;
+  padding: 6px 10px;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+.row-menu button:hover { background: rgba(128, 128, 128, 0.15); }
+.row-menu button.danger { color: #dc2626; }
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 2000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  background: rgba(0, 0, 0, 0.35);
+}
+.modal {
+  width: 380px;
+  max-width: 100%;
+  padding: 20px 22px 16px;
+  background: #fff;
+  border-radius: 10px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.25);
+}
+.modal h3 { margin: 0 0 8px; font-size: 16px; }
+.modal p { margin: 0 0 18px; font-size: 14px; line-height: 1.45; color: #444; }
+.modal-actions { display: flex; justify-content: flex-end; gap: 8px; }
+.modal-actions button.danger-solid {
+  background: #dc2626;
+  border-color: #dc2626;
+  color: #fff;
+}
+.modal-actions button.danger-solid:hover { background: #b91c1c; border-color: #b91c1c; }
 
 .main {
   flex: 1;
@@ -2027,6 +2412,9 @@ button.ghost {
   border-radius: 4px;
   padding: 2px 6px;
   transition: opacity 0.12s ease;
+  /* A label only: it shares the corner with the ⋯ button and, even faded out
+     on hover, would otherwise swallow the button's clicks. */
+  pointer-events: none;
 }
 .conn-card-proto.vnc { background: rgba(13, 148, 136, 0.92); }
 .conn-card-proto.folder { background: rgba(180, 130, 20, 0.92); }
@@ -2058,21 +2446,25 @@ button.ghost {
 .conn-card.drop-before::before { left: 0; }
 .conn-card.drop-after::before { right: 0; }
 /* Hover reveals the action buttons in the same corner; hide the badge then. */
-.conn-card:hover .conn-card-proto { opacity: 0; }
+.conn-card:hover .conn-card-proto,
+.conn-card:has(.conn-card-actions.open) .conn-card-proto { opacity: 0; }
 .conn-card-actions {
   position: absolute;
   top: 8px;
   right: 8px;
+  z-index: 2;
   display: flex;
   gap: 2px;
   opacity: 0;
   transition: opacity 0.12s ease;
 }
-.conn-card:hover .conn-card-actions { opacity: 1; }
+.conn-card:hover .conn-card-actions,
+.conn-card-actions.open { opacity: 1; }
 .conn-card-actions .icon-btn {
-  font-size: 13px;
-  padding: 3px 6px;
-  background: rgba(255, 255, 255, 0.85);
+  font-size: 16px;
+  line-height: 16px;
+  padding: 3px 8px;
+  background: rgba(255, 255, 255, 0.9);
 }
 .icon-btn.danger { color: #c81e1e; }
 
@@ -2377,6 +2769,11 @@ body.dragging * { cursor: grabbing !important; user-select: none; }
   :root { color: #e4e4e7; background: #18181b; }
   .sidebar { background: #1f1f23; border-right-color: #2a2a2e; }
   .sidebar-header { border-bottom-color: #2a2a2e; }
+  .tree-more { color: #a1a1aa; }
+  .row-menu { background: #27272a; border-color: #3f3f46; box-shadow: 0 6px 18px rgba(0, 0, 0, 0.5); }
+  .row-menu button.danger { color: #f87171; }
+  .modal { background: #27272a; box-shadow: 0 12px 40px rgba(0, 0, 0, 0.6); }
+  .modal p { color: #d4d4d8; }
   .conn-list li { border-bottom-color: #27272a; }
   .conn-list li:hover { background: #27272a; }
   .conn-list li.active { background: #1e3a8a; }
@@ -2386,6 +2783,10 @@ body.dragging * { cursor: grabbing !important; user-select: none; }
   .tree-empty { color: #71717a; }
   .tree-count { color: #a1a1aa; background: rgba(255, 255, 255, 0.1); }
   .tree-row.drop-into { background: #1e3a8a; outline-color: #60a5fa; }
+  .tree-row.drop-parent { background: #1e293b; box-shadow: inset 3px 0 0 #60a5fa; }
+  .tree-row.drop-before::before,
+  .tree-row.drop-after::before { border-color: #60a5fa; background: #1f1f23; }
+  .drop-label { background: #3b82f6; }
   .tree-row.drop-before::after,
   .tree-row.drop-after::after { background: #60a5fa; }
   .crumb:hover { background: rgba(255, 255, 255, 0.12); }
