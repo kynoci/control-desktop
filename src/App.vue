@@ -5,6 +5,15 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import Database from "@tauri-apps/plugin-sql";
 import { SCANCODES } from "./scancodes";
 import { keysymFor } from "./keysyms";
+import PreviewPicker from "./PreviewPicker.vue";
+import {
+  settingsFromRow,
+  rowFromSettings,
+  thumbStyle,
+  osLook,
+  type PreviewSettings,
+  type PreviewFit,
+} from "./preview";
 
 // Default listening port per protocol (RDP 3389, VNC display :0 = 5900).
 const DEFAULT_PORTS: Record<string, number> = { rdp: 3389, vnc: 5900 };
@@ -38,19 +47,23 @@ function winClose() {
 // The host's operating system. "linux" covers every distribution — the only thing
 // the app does with it is pick a graphics path, and that splits Windows from the
 // rest, not Ubuntu from Fedora.
-type OsName = "windows" | "linux" | "macos";
+type OsName = "windows" | "linux" | "macos" | "bsd" | "other";
 
 const OS_OPTIONS: { value: OsName; label: string }[] = [
   { value: "windows", label: "Windows" },
   { value: "linux", label: "Linux" },
   { value: "macos", label: "macOS" },
+  { value: "bsd", label: "BSD" },
+  { value: "other", label: "Other" },
 ];
 
 // Windows still has a full legacy bitmap/surface-command path, which
 // `ironrdp-session` decodes itself and which renders correctly today; the Graphics
 // Pipeline is the newer path and its ClearCodec/Planar handling is still settling.
 // Linux (gnome-remote-desktop) has no legacy path at all and drops the connection
-// without EGFX, so it — and macOS, for want of a legacy path to assume — keeps it.
+// without EGFX, so it — and macOS, BSD and Other, for want of a legacy path to
+// assume — keeps it. Advertising EGFX is the safe default for an unknown host: a
+// server without it ignores the offer, while one that needs it hangs up without it.
 // RDP only; VNC ignores this entirely.
 const legacyGraphicsFor = (os: OsName) => os === "windows";
 
@@ -70,6 +83,12 @@ type Connection = {
   folder_id: number | null;
   sort_order: number;
   created_at: number;
+  /// Card preview, as for folders; neither = the OS's default icon card.
+  preview_color: string | null;
+  preview_image: string | null;
+  preview_fit: PreviewFit | null;
+  /// 1 = show the last captured screen when there is one (SQLite has no bool).
+  preview_live: number;
 };
 
 type Folder = {
@@ -78,6 +97,10 @@ type Folder = {
   parent_id: number | null;
   sort_order: number;
   created_at: number;
+  /// Card preview. An image wins over a colour; neither = the default card.
+  preview_color: string | null;
+  preview_image: string | null; // downscaled data URL
+  preview_fit: PreviewFit | null;
 };
 
 // One entry of a folder's contents. Folders and connections share a single
@@ -96,7 +119,13 @@ type Draft = {
   password: string;
   folder_id: number | null;
   os: OsName;
+  look: PreviewSettings;
+  live: boolean;
 };
+
+// Where a connection's Color picker starts. Its default card is the OS icon on
+// the OS's own tint (`osLook`), not a colour.
+const DEFAULT_CONN_COLOR = "#bae6fd";
 
 const blankDraft = (folderId: number | null = null): Draft => ({
   id: null,
@@ -108,6 +137,8 @@ const blankDraft = (folderId: number | null = null): Draft => ({
   password: "",
   folder_id: folderId,
   os: "windows",
+  look: settingsFromRow({ color: null, image: null, fit: null }, DEFAULT_CONN_COLOR),
+  live: true,
 });
 
 const db = ref<Database | null>(null);
@@ -139,10 +170,10 @@ watch(
 async function loadAll() {
   if (!db.value) return;
   folders.value = await db.value.select<Folder[]>(
-    "SELECT id, name, parent_id, sort_order, created_at FROM folders ORDER BY sort_order, name",
+    "SELECT id, name, parent_id, sort_order, created_at, preview_color, preview_image, preview_fit FROM folders ORDER BY sort_order, name",
   );
   connections.value = await db.value.select<Connection[]>(
-    "SELECT id, name, host, port, username, protocol, folder_id, sort_order, created_at, legacy_graphics, os FROM connections ORDER BY sort_order, name",
+    "SELECT id, name, host, port, username, protocol, folder_id, sort_order, created_at, legacy_graphics, os, preview_color, preview_image, preview_fit, preview_live FROM connections ORDER BY sort_order, name",
   );
   // The open folder may be gone (deleted); fall back to the root.
   if (currentFolder.value != null && !folders.value.some((f) => f.id === currentFolder.value)) {
@@ -169,6 +200,63 @@ function itemsIn(folderId: number | null): Item[] {
 }
 
 const currentItems = computed(() => itemsIn(currentFolder.value));
+
+// --- Grid view options (File Explorer style Sort / View menus) --------------
+
+type CardSize = "small" | "medium" | "large" | "xlarge";
+type SortKey = "manual" | "name" | "created" | "type";
+const CARD_SIZES: { key: CardSize; label: string }[] = [
+  { key: "xlarge", label: "Extra large" },
+  { key: "large", label: "Large" },
+  { key: "medium", label: "Medium" },
+  { key: "small", label: "Small" },
+];
+const SORT_KEYS: { key: SortKey; label: string }[] = [
+  { key: "manual", label: "Custom order" },
+  { key: "name", label: "Name" },
+  { key: "created", label: "Date created" },
+  { key: "type", label: "Type" },
+];
+// A per-machine view preference, so localStorage (guarded) is enough.
+function loadPref<T extends string>(key: string, allowed: readonly T[], fallback: T): T {
+  try {
+    const v = localStorage.getItem(key);
+    return v && (allowed as readonly string[]).includes(v) ? (v as T) : fallback;
+  } catch {
+    return fallback;
+  }
+}
+const cardSize = ref<CardSize>(loadPref("view:cardSize", CARD_SIZES.map((s) => s.key), "medium"));
+const sortKey = ref<SortKey>(loadPref("view:sortKey", SORT_KEYS.map((s) => s.key), "manual"));
+const sortDir = ref<"asc" | "desc">(loadPref("view:sortDir", ["asc", "desc"] as const, "asc"));
+watch([cardSize, sortKey, sortDir], ([s, k, d]) => {
+  try {
+    localStorage.setItem("view:cardSize", s);
+    localStorage.setItem("view:sortKey", k);
+    localStorage.setItem("view:sortDir", d);
+  } catch { /* ignore */ }
+});
+// Which toolbar dropdown is open.
+const viewMenu = ref<"sort" | "view" | null>(null);
+
+// What the grid shows. "Custom order" is the drag-sorted `sort_order`; the
+// other sorts keep folders first (as Explorer does) and apply the direction
+// within each group.
+const gridItems = computed(() => {
+  const items = currentItems.value;
+  if (sortKey.value === "manual") return items;
+  const dir = sortDir.value === "asc" ? 1 : -1;
+  const byName = (a: Item, b: Item) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" });
+  const created = (i: Item) => (i.kind === "folder" ? i.folder.created_at : i.conn.created_at) ?? 0;
+  const type = (i: Item) => (i.kind === "folder" ? "" : i.conn.protocol);
+  return [...items].sort((a, b) => {
+    if (a.kind !== b.kind) return a.kind === "folder" ? -1 : 1;
+    let c = 0;
+    if (sortKey.value === "created") c = created(a) < created(b) ? -1 : created(a) > created(b) ? 1 : 0;
+    else if (sortKey.value === "type") c = type(a).localeCompare(type(b));
+    return dir * (c || byName(a, b));
+  });
+});
 
 // Folder ids and connection ids come from different tables, so neither alone is
 // a unique key across a mixed list.
@@ -279,7 +367,7 @@ function rowMenuEdit() {
   const it = rowMenu.value?.item;
   rowMenu.value = null;
   if (!it) return;
-  if (it.kind === "folder") renameFolder(it.folder);
+  if (it.kind === "folder") editFolder(it.folder);
   else editConn(it.conn);
 }
 function rowMenuDuplicate() {
@@ -336,24 +424,46 @@ function openFolder(id: number | null) {
 
 // --- Folder create / rename / delete ----------------------------------------
 
-const folderDraft = ref<{ id: number | null; name: string; parent_id: number | null }>({
-  id: null,
-  name: "",
-  parent_id: null,
-});
+type FolderDraft = {
+  id: number | null;
+  name: string;
+  parent_id: number | null;
+  look: PreviewSettings;
+};
+// The default folder card's colour; also where the Color picker starts.
+const DEFAULT_FOLDER_COLOR = "#f6e4bb";
+const FOLDER_BG = "linear-gradient(160deg, #fdf3dc 0%, #f6e4bb 100%)";
+
+function blankFolderDraft(parent: number | null): FolderDraft {
+  return { id: null, name: "", parent_id: parent, look: settingsFromRow({ color: null, image: null, fit: null }, DEFAULT_FOLDER_COLOR) };
+}
+const folderDraft = ref<FolderDraft>(blankFolderDraft(null));
 const editingFolder = ref(false);
 
 function newFolder() {
-  folderDraft.value = { id: null, name: "", parent_id: currentFolder.value };
+  folderDraft.value = blankFolderDraft(currentFolder.value);
   editing.value = false;
   editingFolder.value = true;
 }
 
-function renameFolder(f: Folder) {
-  folderDraft.value = { id: f.id, name: f.name, parent_id: f.parent_id ?? null };
+function editFolder(f: Folder) {
+  folderDraft.value = {
+    id: f.id,
+    name: f.name,
+    parent_id: f.parent_id ?? null,
+    look: settingsFromRow({ color: f.preview_color, image: f.preview_image, fit: f.preview_fit }, DEFAULT_FOLDER_COLOR),
+  };
   editing.value = false;
   editingFolder.value = true;
 }
+
+// `undefined` for a default folder keeps the stylesheet's gradient (which has a
+// dark-mode variant); the fallback only shows behind an image with no colour.
+function folderCardStyle(f: Folder) {
+  return thumbStyle({ color: f.preview_color, image: f.preview_image, fit: f.preview_fit }, f.preview_image ? FOLDER_BG : undefined);
+}
+// The folder draft as it would be saved, for the live sample in the editor.
+const folderDraftRow = computed(() => rowFromSettings(folderDraft.value.look, DEFAULT_FOLDER_COLOR));
 
 async function saveFolder() {
   if (!db.value) return;
@@ -367,11 +477,16 @@ async function saveFolder() {
     status.value = "A folder cannot be moved inside itself";
     return;
   }
+  if (d.look.mode === "image" && !d.look.image) {
+    status.value = "Choose an image for the preview, or pick another preview style";
+    return;
+  }
+  const p = folderDraftRow.value;
   try {
     if (d.id == null) {
       await db.value.execute(
-        "INSERT INTO folders (name, parent_id, sort_order) VALUES ($1, $2, $3)",
-        [name, d.parent_id, itemsIn(d.parent_id).length],
+        "INSERT INTO folders (name, parent_id, sort_order, preview_color, preview_image, preview_fit) VALUES ($1, $2, $3, $4, $5, $6)",
+        [name, d.parent_id, itemsIn(d.parent_id).length, p.color, p.image, p.fit],
       );
     } else {
       const prev = folders.value.find((f) => f.id === d.id);
@@ -381,8 +496,8 @@ async function saveFolder() {
           ? itemsIn(d.parent_id).length
           : (prev?.sort_order ?? 0);
       await db.value.execute(
-        "UPDATE folders SET name=$1, parent_id=$2, sort_order=$3 WHERE id=$4",
-        [name, d.parent_id, order, d.id],
+        "UPDATE folders SET name=$1, parent_id=$2, sort_order=$3, preview_color=$4, preview_image=$5, preview_fit=$6 WHERE id=$7",
+        [name, d.parent_id, order, p.color, p.image, p.fit, d.id],
       );
     }
     await loadAll();
@@ -559,6 +674,12 @@ function updateDropHint(x: number, y: number) {
     // (and anywhere on a connection card) mean "insert on this side".
     if (target.kind === "folder" && !self && rel > 0.25 && rel < 0.75 && canMove(d, target.id)) {
       dropHint.value = { key, mode: "into", folderId: target.id };
+    } else if (sortKey.value !== "manual") {
+      // A sorted grid has no positions to drop between; only "into" makes sense.
+      // (Reordering stays available in the sidebar and under Custom order.)
+      dropHint.value = target.kind === "folder" && !self && canMove(d, target.id)
+        ? { key, mode: "into", folderId: target.id }
+        : null;
     } else {
       dropHint.value = {
         key,
@@ -606,10 +727,19 @@ function updateDropHint(x: number, y: number) {
   // the nearest card in the same row — otherwise a near-miss on a reorder would
   // silently become "move to the end of this folder".
   if (key === "grid") {
-    const near = nearestCardHint(x, y);
-    if (near) {
-      dropHint.value = near;
-      return;
+    if (sortKey.value !== "manual") {
+      // Sorted: the background only accepts items from other folders.
+      const inHere = currentItems.value.some((i) => i.kind === d.kind && i.id === d.id);
+      if (inHere) {
+        dropHint.value = null;
+        return;
+      }
+    } else {
+      const near = nearestCardHint(x, y);
+      if (near) {
+        dropHint.value = near;
+        return;
+      }
     }
   }
 
@@ -847,10 +977,34 @@ function editConn(c: Connection) {
     password: "",
     folder_id: c.folder_id ?? null,
     os: c.os ?? "windows",
+    look: settingsFromRow({ color: c.preview_color, image: c.preview_image, fit: c.preview_fit }, DEFAULT_CONN_COLOR),
+    live: c.preview_live !== 0,
   };
   editing.value = true;
   editingFolder.value = false;
 }
+
+// A connection's card: the last captured screen when that's enabled and one
+// exists, otherwise its preview — by default the OS icon on the OS's tint.
+function showsLiveThumb(c: { id: number | null; preview_live: number }) {
+  return c.preview_live !== 0 && c.id != null && !!thumbnails.value[c.id];
+}
+function connCardStyle(c: { os: string; preview_color: string | null; preview_image: string | null; preview_fit: PreviewFit | null }) {
+  return thumbStyle({ color: c.preview_color, image: c.preview_image, fit: c.preview_fit }, osLook(c.os).bg);
+}
+// The connection draft in stored form, for the editor's live sample card.
+const draftConnRow = computed(() => {
+  const d = draft.value;
+  const row = rowFromSettings(d.look, DEFAULT_CONN_COLOR);
+  return {
+    id: d.id,
+    os: d.os,
+    preview_color: row.color,
+    preview_image: row.image,
+    preview_fit: row.fit,
+    preview_live: d.live ? 1 : 0,
+  };
+});
 
 async function saveDraft() {
   if (!db.value) return;
@@ -859,14 +1013,20 @@ async function saveDraft() {
     status.value = "Name, host, and username are required";
     return;
   }
+  if (d.look.mode === "image" && !d.look.image) {
+    status.value = "Choose an image for the preview, or pick another preview style";
+    return;
+  }
+  const p = draftConnRow.value;
   try {
     let id: number;
     if (d.id == null) {
       const res = await db.value.execute(
-        "INSERT INTO connections (name, host, port, username, protocol, folder_id, sort_order, os, legacy_graphics) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+        "INSERT INTO connections (name, host, port, username, protocol, folder_id, sort_order, os, legacy_graphics, preview_color, preview_image, preview_fit, preview_live) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
         // legacy_graphics is derived from os, written alongside it so the row stays
         // self-consistent for anything reading the column directly.
-        [d.name, d.host, d.port, d.username, d.protocol, d.folder_id, itemsIn(d.folder_id).length, d.os, legacyGraphicsFor(d.os) ? 1 : 0],
+        [d.name, d.host, d.port, d.username, d.protocol, d.folder_id, itemsIn(d.folder_id).length, d.os, legacyGraphicsFor(d.os) ? 1 : 0,
+          p.preview_color, p.preview_image, p.preview_fit, p.preview_live],
       );
       id = Number(res.lastInsertId);
     } else {
@@ -879,8 +1039,9 @@ async function saveDraft() {
           ? itemsIn(d.folder_id).length
           : (prev?.sort_order ?? 0);
       await db.value.execute(
-        "UPDATE connections SET name=$1, host=$2, port=$3, username=$4, protocol=$5, folder_id=$6, sort_order=$7, os=$8, legacy_graphics=$9 WHERE id=$10",
-        [d.name, d.host, d.port, d.username, d.protocol, d.folder_id, order, d.os, legacyGraphicsFor(d.os) ? 1 : 0, id],
+        "UPDATE connections SET name=$1, host=$2, port=$3, username=$4, protocol=$5, folder_id=$6, sort_order=$7, os=$8, legacy_graphics=$9, preview_color=$10, preview_image=$11, preview_fit=$12, preview_live=$13 WHERE id=$14",
+        [d.name, d.host, d.port, d.username, d.protocol, d.folder_id, order, d.os, legacyGraphicsFor(d.os) ? 1 : 0,
+          p.preview_color, p.preview_image, p.preview_fit, p.preview_live, id],
       );
     }
     if (d.password) {
@@ -902,8 +1063,9 @@ async function duplicateConn(c: Connection) {
   const os = c.os ?? "windows";
   try {
     const res = await db.value.execute(
-      "INSERT INTO connections (name, host, port, username, protocol, folder_id, sort_order, os, legacy_graphics) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
-      [`${c.name} (copy)`, c.host, c.port, c.username, c.protocol, folder, itemsIn(folder).length, os, legacyGraphicsFor(os) ? 1 : 0],
+      "INSERT INTO connections (name, host, port, username, protocol, folder_id, sort_order, os, legacy_graphics, preview_color, preview_image, preview_fit, preview_live) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+      [`${c.name} (copy)`, c.host, c.port, c.username, c.protocol, folder, itemsIn(folder).length, os, legacyGraphicsFor(os) ? 1 : 0,
+        c.preview_color, c.preview_image, c.preview_fit, c.preview_live ?? 1],
     );
     const id = Number(res.lastInsertId);
     const password = await invoke<string | null>("get_password", { connectionId: c.id });
@@ -1413,11 +1575,18 @@ onMounted(async () => {
     if (e.key === "Escape") {
       cancelDrag();
       rowMenu.value = null;
+      viewMenu.value = null;
       if (confirmDialog.value) closeConfirm(false);
     }
   });
-  window.addEventListener("click", () => (rowMenu.value = null));
-  window.addEventListener("blur", () => (rowMenu.value = null));
+  window.addEventListener("click", () => {
+    rowMenu.value = null;
+    viewMenu.value = null;
+  });
+  window.addEventListener("blur", () => {
+    rowMenu.value = null;
+    viewMenu.value = null;
+  });
   // When the app regains focus (e.g. after copying in another app), prime the
   // active session's remote clipboard with the local clipboard contents.
   window.addEventListener("focus", () => {
@@ -1615,7 +1784,7 @@ onMounted(async () => {
         🖥 Open with Windows RDP
       </button>
       <button @click="rowMenuEdit">
-        ✎ {{ rowMenu.item.kind === "folder" ? "Rename / move" : "Edit" }}
+        ✎ Edit
       </button>
       <button v-if="rowMenu.item.kind === 'conn'" @click="rowMenuDuplicate">⧉ Duplicate</button>
       <button class="danger" @click="rowMenuDelete">🗑 Delete</button>
@@ -1681,7 +1850,7 @@ onMounted(async () => {
             {{
               legacyGraphicsFor(draft.os)
                 ? "Windows renders through its legacy bitmap path."
-                : "Uses the Graphics Pipeline (EGFX), which Linux hosts require."
+                : "Uses the Graphics Pipeline (EGFX), which Linux hosts require and other hosts accept."
             }}
           </small>
         </label>
@@ -1692,6 +1861,41 @@ onMounted(async () => {
             <option v-for="o in folderOptions" :key="o.id" :value="o.id">{{ o.label }}</option>
           </select>
         </label>
+
+        <!-- Card preview: the last screen (when enabled and captured), else the
+             OS icon, a colour, or the user's image. -->
+        <PreviewPicker v-model="draft.look">
+          <template #sample>
+            <div class="conn-card preview-sample">
+              <span class="conn-card-proto" :class="draft.protocol">{{ draft.protocol.toUpperCase() }}</span>
+              <div v-if="showsLiveThumb(draftConnRow)" class="conn-card-thumb">
+                <img :src="thumbnails[draft.id!]" alt="" draggable="false" />
+              </div>
+              <div v-else class="conn-card-thumb" :style="connCardStyle(draftConnRow)">
+                <span v-if="!draftConnRow.preview_image" class="os-glyph" v-html="osLook(draft.os).svg"></span>
+              </div>
+              <div class="conn-card-info">
+                <div class="conn-card-name">{{ draft.name.trim() || "Connection name" }}</div>
+              </div>
+            </div>
+          </template>
+          <template #top>
+            <label class="check">
+              <input v-model="draft.live" type="checkbox" />
+              <span>
+                Show last screen
+                <small>
+                  The most recent capture of the remote desktop, when there is one.
+                  <template v-if="draft.live && !(draft.id != null && thumbnails[draft.id])">
+                    None captured yet — the style below shows until you connect.
+                  </template>
+                  <template v-else-if="draft.live">The style below shows only when there's no capture.</template>
+                </small>
+              </span>
+            </label>
+          </template>
+        </PreviewPicker>
+
         <div class="actions">
           <button class="primary" @click="saveDraft">Save</button>
           <button @click="cancelEdit">Cancel</button>
@@ -1699,7 +1903,7 @@ onMounted(async () => {
       </section>
 
       <section v-else-if="editingFolder" class="form">
-        <h2>{{ folderDraft.id == null ? "New folder" : "Rename folder" }}</h2>
+        <h2>{{ folderDraft.id == null ? "New folder" : "Edit folder" }}</h2>
         <label>
           Name
           <input v-model="folderDraft.name" placeholder="Production servers" @keyup.enter="saveFolder" />
@@ -1711,6 +1915,25 @@ onMounted(async () => {
             <option v-for="o in parentOptions" :key="o.id" :value="o.id">{{ o.label }}</option>
           </select>
         </label>
+
+        <!-- Card preview: the default yellow card, a colour, or the user's image. -->
+        <PreviewPicker v-model="folderDraft.look">
+          <template #sample>
+            <div class="conn-card folder-card preview-sample">
+              <span class="conn-card-proto folder">FOLDER</span>
+              <div
+                class="conn-card-thumb folder-thumb"
+                :style="thumbStyle(folderDraftRow, folderDraftRow.image ? FOLDER_BG : undefined)"
+              >
+                <span v-if="!folderDraftRow.image" class="folder-glyph">📁</span>
+              </div>
+              <div class="conn-card-info">
+                <div class="conn-card-name">{{ folderDraft.name.trim() || "Folder name" }}</div>
+              </div>
+            </div>
+          </template>
+        </PreviewPicker>
+
         <div class="actions">
           <button class="primary" @click="saveFolder">Save</button>
           <button @click="cancelEdit">Cancel</button>
@@ -1744,6 +1967,62 @@ onMounted(async () => {
             </button>
           </template>
           <span class="crumbs-spacer"></span>
+          <div class="toolbar-drop">
+            <button
+              class="ghost"
+              :class="{ open: viewMenu === 'sort' }"
+              title="Sort cards"
+              @click.stop="viewMenu = viewMenu === 'sort' ? null : 'sort'"
+            >
+              ⇅ Sort <span class="chev">▾</span>
+            </button>
+            <div v-if="viewMenu === 'sort'" class="toolbar-menu" @click.stop>
+              <button
+                v-for="s in SORT_KEYS"
+                :key="s.key"
+                :class="{ checked: sortKey === s.key }"
+                @click="sortKey = s.key; viewMenu = null"
+              >
+                {{ s.label }}
+              </button>
+              <div class="menu-sep"></div>
+              <button
+                :class="{ checked: sortDir === 'asc' }"
+                :disabled="sortKey === 'manual'"
+                @click="sortDir = 'asc'; viewMenu = null"
+              >
+                Ascending
+              </button>
+              <button
+                :class="{ checked: sortDir === 'desc' }"
+                :disabled="sortKey === 'manual'"
+                @click="sortDir = 'desc'; viewMenu = null"
+              >
+                Descending
+              </button>
+            </div>
+          </div>
+          <div class="toolbar-drop">
+            <button
+              class="ghost"
+              :class="{ open: viewMenu === 'view' }"
+              title="Card size"
+              @click.stop="viewMenu = viewMenu === 'view' ? null : 'view'"
+            >
+              ▦ View <span class="chev">▾</span>
+            </button>
+            <div v-if="viewMenu === 'view'" class="toolbar-menu" @click.stop>
+              <button
+                v-for="s in CARD_SIZES"
+                :key="s.key"
+                :class="{ checked: cardSize === s.key }"
+                @click="cardSize = s.key; viewMenu = null"
+              >
+                <span class="size-glyph" :class="'g-' + s.key"></span>
+                {{ s.label }} cards
+              </button>
+            </div>
+          </div>
           <button class="ghost" title="Create a folder here" @click="newFolder">🗀 New folder</button>
         </nav>
 
@@ -1751,13 +2030,13 @@ onMounted(async () => {
              the dragged item into this folder, at the end. -->
         <div
           class="conn-grid"
-          :class="{ 'drop-into': dropHint?.key === 'grid' }"
+          :class="['size-' + cardSize, { 'drop-into': dropHint?.key === 'grid' }]"
           data-drop-key="grid"
           data-drop-kind="folder"
           :data-drop-folder="currentFolder ?? ''"
         >
           <div
-            v-for="it in currentItems"
+            v-for="it in gridItems"
             :key="itemKey(it)"
             class="conn-card"
             :class="[it.kind === 'folder' ? 'folder-card' : '', dropClass(it)]"
@@ -1772,8 +2051,8 @@ onMounted(async () => {
               <div class="conn-card-actions" :class="{ open: rowMenu && itemKey(rowMenu.item) === itemKey(it) }">
                 <button class="icon-btn" title="More actions" @click.stop="(e) => toggleRowMenu(e, it)">⋯</button>
               </div>
-              <div class="conn-card-thumb folder-thumb">
-                <span class="folder-glyph">📁</span>
+              <div class="conn-card-thumb folder-thumb" :style="folderCardStyle(it.folder)">
+                <span v-if="!it.folder.preview_image" class="folder-glyph">📁</span>
               </div>
               <div class="conn-card-info">
                 <div class="conn-card-name">{{ it.name }}</div>
@@ -1789,9 +2068,11 @@ onMounted(async () => {
               <div class="conn-card-actions" :class="{ open: rowMenu && itemKey(rowMenu.item) === itemKey(it) }">
                 <button class="icon-btn" title="More actions" @click.stop="(e) => toggleRowMenu(e, it)">⋯</button>
               </div>
-              <div class="conn-card-thumb">
-                <img v-if="thumbnails[it.id]" :src="thumbnails[it.id]" alt="" draggable="false" />
-                <span v-else class="conn-card-thumb-empty">🖥</span>
+              <div v-if="showsLiveThumb(it.conn)" class="conn-card-thumb">
+                <img :src="thumbnails[it.id]" alt="" draggable="false" />
+              </div>
+              <div v-else class="conn-card-thumb" :style="connCardStyle(it.conn)">
+                <span v-if="!it.conn.preview_image" class="os-glyph" v-html="osLook(it.conn.os).svg"></span>
               </div>
               <div class="conn-card-info">
                 <div class="conn-card-name">{{ it.name }}</div>
@@ -2344,9 +2625,76 @@ button.ghost {
 }
 
 /* Connection cards — click to connect (built-in IronRDP). */
+/* Sort / View dropdowns in the breadcrumb bar. */
+.toolbar-drop { position: relative; }
+button.ghost.open { background: rgba(128, 128, 128, 0.15); }
+.chev { font-size: 9px; opacity: 0.6; margin-left: 2px; }
+.toolbar-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  z-index: 1000;
+  min-width: 190px;
+  padding: 4px;
+  background: #fff;
+  border: 1px solid rgba(0, 0, 0, 0.12);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.15);
+  display: flex;
+  flex-direction: column;
+}
+.toolbar-menu button {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  text-align: left;
+  /* Room on the left for the "selected" dot, as in File Explorer. */
+  padding: 7px 12px 7px 28px;
+  position: relative;
+  border: none;
+  border-radius: 5px;
+  background: transparent;
+  color: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+.toolbar-menu button:hover:not(:disabled) { background: rgba(128, 128, 128, 0.14); }
+.toolbar-menu button:disabled { opacity: 0.4; cursor: default; }
+.toolbar-menu button.checked::before {
+  content: "";
+  position: absolute;
+  left: 12px;
+  top: 50%;
+  width: 6px;
+  height: 6px;
+  margin-top: -3px;
+  border-radius: 50%;
+  background: currentColor;
+}
+.menu-sep { height: 1px; margin: 4px 6px; background: rgba(128, 128, 128, 0.25); }
+/* Little outline rectangles that scale with the size they stand for. */
+.size-glyph {
+  flex: 0 0 18px;
+  display: flex;
+  justify-content: center;
+}
+.size-glyph::before {
+  content: "";
+  border: 1.5px solid currentColor;
+  border-radius: 2px;
+  opacity: 0.75;
+}
+.size-glyph.g-xlarge::before { width: 16px; height: 12px; }
+.size-glyph.g-large::before { width: 13px; height: 10px; }
+.size-glyph.g-medium::before { width: 10px; height: 8px; }
+.size-glyph.g-small::before { width: 7px; height: 6px; }
+
 .conn-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  /* Fixed-width columns: every card is the same size for the chosen View,
+     rather than stretching to fill the row. */
+  --card-w: 230px;
+  grid-template-columns: repeat(auto-fill, var(--card-w));
   gap: 14px;
   align-content: start;
   /* Give the grid a floor so there is always empty space to drop onto. */
@@ -2355,6 +2703,21 @@ button.ghost {
   border: 2px dashed transparent;
   padding: 4px;
   margin: -4px;
+}
+.conn-grid.size-small { --card-w: 170px; gap: 10px; }
+.conn-grid.size-medium { --card-w: 230px; }
+.conn-grid.size-large { --card-w: 310px; gap: 16px; }
+.conn-grid.size-xlarge { --card-w: 420px; gap: 18px; }
+/* Small cards: tighter text, name only (the host rarely fits). */
+.conn-grid.size-small .conn-card-info { padding: 8px 10px; }
+.conn-grid.size-small .conn-card-name { font-size: 13px; }
+.conn-grid.size-small .conn-card-host { display: none; }
+.conn-grid.size-small .conn-card.add { min-height: 120px; }
+.conn-grid.size-small .folder-glyph { font-size: 40px; }
+.conn-grid.size-xlarge .conn-card-name { font-size: 16px; }
+/* Keep the column narrow enough to fit a phone-sized window. */
+@media (max-width: 520px) {
+  .conn-grid { grid-template-columns: repeat(auto-fill, minmax(min(var(--card-w), 100%), 1fr)); }
 }
 /* Dragging over the grid background = move into the folder that's open. */
 .conn-grid.drop-into { border-color: #2563eb; background: rgba(37, 99, 235, 0.05); }
@@ -2382,14 +2745,21 @@ button.ghost {
   overflow: hidden;
 }
 .conn-card-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
-.conn-card-thumb-empty { font-size: 30px; opacity: 0.35; }
 .conn-card-info {
   padding: 11px 13px;
   display: flex;
   align-items: baseline;
   gap: 8px;
 }
-.conn-card-name { font-weight: 600; font-size: 15px; flex: 0 0 auto; }
+.conn-card-name {
+  font-weight: 600;
+  font-size: 15px;
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .conn-card-host {
   font-size: 12px;
   color: #666;
@@ -2514,6 +2884,106 @@ button.ghost {
   font-size: 12px;
   line-height: 1.4;
 }
+
+/* Folder preview editor: a live sample card beside its controls. */
+.field { margin-bottom: 12px; font-size: 13px; color: #444; }
+.field-label { display: block; margin-bottom: 6px; }
+.preview-editor { display: flex; gap: 16px; align-items: flex-start; flex-wrap: wrap; }
+.preview-sample { flex: 0 0 200px; cursor: default; }
+.preview-sample:active { transform: none; }
+/* Real cards fade the badge on hover to make room for the ⋯ button; the sample
+   has no button, so it keeps the badge and skips the hover styling. */
+.conn-card.preview-sample:hover { border-color: #d8d8de; box-shadow: none; }
+.conn-card.preview-sample:hover .conn-card-proto { opacity: 1; }
+.preview-controls {
+  flex: 1 1 220px;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.sub-label { font-size: 12px; color: #666; margin-top: 2px; }
+.segmented {
+  display: inline-flex;
+  align-self: flex-start;
+  padding: 2px;
+  border: 1px solid #c5c5cb;
+  border-radius: 7px;
+  background: #fff;
+}
+.segmented button {
+  padding: 5px 12px;
+  border: none;
+  border-radius: 5px;
+  background: transparent;
+  font-size: 13px;
+  color: inherit;
+}
+.segmented button.on { background: #2563eb; color: #fff; }
+.segmented.small button { padding: 3px 10px; font-size: 12px; }
+.swatches { display: flex; flex-wrap: wrap; gap: 6px; }
+.swatch {
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 1px solid rgba(0, 0, 0, 0.15);
+  border-radius: 50%;
+  cursor: pointer;
+}
+.swatch.on { box-shadow: 0 0 0 2px #fff, 0 0 0 4px #2563eb; }
+/* The native colour input, clipped to a rainbow circle. */
+.swatch.custom {
+  position: relative;
+  overflow: hidden;
+  margin: 0;
+  background: conic-gradient(#f87171, #fbbf24, #4ade80, #22d3ee, #818cf8, #e879f9, #f87171);
+}
+.form .swatch.custom input {
+  position: absolute;
+  inset: -8px;
+  width: 40px;
+  height: 40px;
+  margin: 0;
+  padding: 0;
+  border: none;
+  opacity: 0;
+  cursor: pointer;
+}
+.image-row { display: flex; gap: 8px; align-items: center; }
+/* "Show last screen" toggle above the preview styles. */
+.form label.check {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  margin: 0 0 4px;
+  cursor: pointer;
+}
+.form label.check input {
+  display: inline-block;
+  width: auto;
+  margin: 2px 0 0;
+  padding: 0;
+  accent-color: #2563eb;
+}
+.form label.check small { margin-top: 2px; }
+/* Default connection card: the OS icon, sized with the card. */
+.os-glyph { display: flex; width: 34%; max-width: 96px; aspect-ratio: 1; }
+.os-glyph svg { width: 100%; height: 100%; }
+.form .file-btn {
+  display: inline-block;
+  margin: 0;
+  padding: 6px 12px;
+  border: 1px solid #c5c5cb;
+  border-radius: 6px;
+  background: #fff;
+  font-size: 13px;
+  color: inherit;
+  cursor: pointer;
+}
+.form .file-btn:hover { border-color: #2563eb; color: #2563eb; }
+.form .file-btn input { display: none; }
+.hint { font-size: 12px; color: #777; line-height: 1.4; }
+.hint.error { color: #dc2626; }
 
 .details dl {
   display: grid;
@@ -2771,6 +3241,7 @@ body.dragging * { cursor: grabbing !important; user-select: none; }
   .sidebar-header { border-bottom-color: #2a2a2e; }
   .tree-more { color: #a1a1aa; }
   .row-menu { background: #27272a; border-color: #3f3f46; box-shadow: 0 6px 18px rgba(0, 0, 0, 0.5); }
+  .toolbar-menu { background: #27272a; border-color: #3f3f46; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5); }
   .row-menu button.danger { color: #f87171; }
   .modal { background: #27272a; box-shadow: 0 12px 40px rgba(0, 0, 0, 0.6); }
   .modal p { color: #d4d4d8; }
@@ -2808,6 +3279,7 @@ body.dragging * { cursor: grabbing !important; user-select: none; }
   .sidebar-expand:hover { background: #3f3f46; }
   .icon-btn:hover { background: rgba(255, 255, 255, 0.12); }
   .conn-card { background: #1f1f23; border-color: #2f2f35; }
+  .conn-card.preview-sample:hover { border-color: #2f2f35; }
   .conn-card:hover { border-color: #3b5bdb; box-shadow: 0 2px 12px rgba(0, 0, 0, 0.5); }
   .conn-card-host { color: #a1a1aa; }
   /* Keep the solid colored badge in dark mode (white text reads on both). */
@@ -2819,6 +3291,10 @@ body.dragging * { cursor: grabbing !important; user-select: none; }
     border-color: #3f3f46;
     color: #e4e4e7;
   }
+  .field, .sub-label { color: #a1a1aa; }
+  .segmented, .form .file-btn { background: #27272a; border-color: #3f3f46; }
+  .segmented button:not(.on) { background: transparent; }
+  .swatch.on { box-shadow: 0 0 0 2px #18181b, 0 0 0 4px #60a5fa; }
   button { background: #27272a; color: #e4e4e7; border-color: #3f3f46; }
   button:hover { background: #3f3f46; }
   button.danger { background: #27272a; color: #f87171; border-color: #7f1d1d; }

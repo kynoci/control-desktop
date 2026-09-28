@@ -26,7 +26,7 @@ pub struct ConnectRequest {
     /// Only meaningful for RDP, and only usable against servers that still have a
     /// legacy path: Windows does, `gnome-remote-desktop` does not (it drops the
     /// connection without EGFX). The frontend derives this from the connection's
-    /// `os` field — Windows takes the legacy path, Linux and macOS take EGFX.
+    /// `os` field — Windows takes the legacy path, every other OS takes EGFX.
     #[serde(default)]
     pub legacy_graphics: bool,
 }
@@ -178,6 +178,30 @@ pub fn run() {
             sql: "ALTER TABLE connections ADD COLUMN os TEXT NOT NULL DEFAULT 'windows';
         UPDATE connections SET os = 'linux' WHERE protocol = 'vnc';
         UPDATE connections SET legacy_graphics = CASE WHEN os = 'windows' THEN 1 ELSE 0 END;",
+            kind: MigrationKind::Up,
+        },
+        // Custom folder card previews. All NULL = the default yellow folder card.
+        // `preview_color` is a CSS hex colour; `preview_image` a data URL the
+        // frontend has already downscaled, so rows stay small; `preview_fit` is
+        // 'cover' or 'contain' for how that image sits in the card.
+        Migration {
+            version: 5,
+            description: "add_folder_preview",
+            sql: "ALTER TABLE folders ADD COLUMN preview_color TEXT;
+        ALTER TABLE folders ADD COLUMN preview_image TEXT;
+        ALTER TABLE folders ADD COLUMN preview_fit TEXT;",
+            kind: MigrationKind::Up,
+        },
+        // The same card preview for connections, plus `preview_live`: 1 = show the
+        // last captured screen when there is one (the old, and default, behaviour),
+        // 0 = always show the preview above.
+        Migration {
+            version: 6,
+            description: "add_connection_preview",
+            sql: "ALTER TABLE connections ADD COLUMN preview_color TEXT;
+        ALTER TABLE connections ADD COLUMN preview_image TEXT;
+        ALTER TABLE connections ADD COLUMN preview_fit TEXT;
+        ALTER TABLE connections ADD COLUMN preview_live INTEGER NOT NULL DEFAULT 1;",
             kind: MigrationKind::Up,
         },
     ];
