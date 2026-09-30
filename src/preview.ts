@@ -141,6 +141,25 @@ export const OS_LOOK: Record<string, { svg: string; bg: string }> = {
   },
 };
 
+// User-supplied icons in src/assets/os/ override the drawings above. A file
+// counts for an OS when its name is the OS key or starts with it, so
+// `windows.svg` and `windows11.svg` both work; an exact name wins. SVG or PNG.
+const ICON_FILES = import.meta.glob("./assets/os/*.{svg,png}", {
+  eager: true,
+  query: "?url",
+  import: "default",
+}) as Record<string, string>;
+
+const OS_ICON_URL: Record<string, string> = {};
+for (const [path, url] of Object.entries(ICON_FILES)) {
+  const base = path.split("/").pop()!.replace(/\.(svg|png)$/i, "").toLowerCase();
+  for (const key of Object.keys(OS_LOOK)) {
+    if (base === key) OS_ICON_URL[key] = url;
+    else if (base.startsWith(key) && !OS_ICON_URL[key]) OS_ICON_URL[key] = url;
+  }
+}
+
 export function osLook(os: string | null | undefined) {
-  return OS_LOOK[os ?? "windows"] ?? OS_LOOK.other;
+  const key = os && OS_LOOK[os] ? os : os ? "other" : "windows";
+  return { ...OS_LOOK[key], icon: OS_ICON_URL[key] as string | undefined };
 }

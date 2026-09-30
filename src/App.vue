@@ -1872,7 +1872,10 @@ onMounted(async () => {
                 <img :src="thumbnails[draft.id!]" alt="" draggable="false" />
               </div>
               <div v-else class="conn-card-thumb" :style="connCardStyle(draftConnRow)">
-                <span v-if="!draftConnRow.preview_image" class="os-glyph" v-html="osLook(draft.os).svg"></span>
+                <span v-if="!draftConnRow.preview_image" class="os-glyph">
+                  <img v-if="osLook(draft.os).icon" :src="osLook(draft.os).icon" alt="" draggable="false" />
+                  <span v-else class="os-draw" v-html="osLook(draft.os).svg"></span>
+                </span>
               </div>
               <div class="conn-card-info">
                 <div class="conn-card-name">{{ draft.name.trim() || "Connection name" }}</div>
@@ -2072,7 +2075,10 @@ onMounted(async () => {
                 <img :src="thumbnails[it.id]" alt="" draggable="false" />
               </div>
               <div v-else class="conn-card-thumb" :style="connCardStyle(it.conn)">
-                <span v-if="!it.conn.preview_image" class="os-glyph" v-html="osLook(it.conn.os).svg"></span>
+                <span v-if="!it.conn.preview_image" class="os-glyph">
+                  <img v-if="osLook(it.conn.os).icon" :src="osLook(it.conn.os).icon" alt="" draggable="false" />
+                  <span v-else class="os-draw" v-html="osLook(it.conn.os).svg"></span>
+                </span>
               </div>
               <div class="conn-card-info">
                 <div class="conn-card-name">{{ it.name }}</div>
@@ -2968,7 +2974,10 @@ button.ghost.open { background: rgba(128, 128, 128, 0.15); }
 .form label.check small { margin-top: 2px; }
 /* Default connection card: the OS icon, sized with the card. */
 .os-glyph { display: flex; width: 34%; max-width: 96px; aspect-ratio: 1; }
-.os-glyph svg { width: 100%; height: 100%; }
+.os-draw { display: flex; width: 100%; height: 100%; }
+.os-draw svg { width: 100%; height: 100%; }
+/* A user icon from src/assets/os/: whole, never cropped like a screen capture. */
+.conn-card-thumb .os-glyph img { width: 100%; height: 100%; object-fit: contain; }
 .form .file-btn {
   display: inline-block;
   margin: 0;
