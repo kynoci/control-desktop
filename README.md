@@ -166,3 +166,9 @@ src-tauri/
 - SFTP file browser
 - Connection grouping, search, import from existing `.rdp` / PuTTY profiles
 - Optional master password to lock the app
+
+---
+
+## License
+
+GPL-3.0-only © kynoci — see [LICENSE](LICENSE).

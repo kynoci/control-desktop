@@ -2,6 +2,8 @@
   "name": "remote-pc-manager",
   "private": true,
   "version": "0.1.0",
+  "author": "kynoci",
+  "license": "GPL-3.0-only",
   "type": "module",
   "scripts": {
     "dev": "vite",

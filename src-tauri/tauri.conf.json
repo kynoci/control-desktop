@@ -26,6 +26,9 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "publisher": "kynoci",
+    "copyright": "Copyright © 2026 kynoci",
+    "license": "GPL-3.0-only",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
