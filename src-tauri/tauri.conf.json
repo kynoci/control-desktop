@@ -29,6 +29,9 @@
     "publisher": "kynoci",
     "copyright": "Copyright © 2026 kynoci",
     "license": "GPL-3.0-only",
+    "macOS": {
+      "signingIdentity": "-"
+    },
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
