@@ -169,6 +169,41 @@ src-tauri/
 
 ---
 
+## Download
+
+Prebuilt installers for Windows, Linux and macOS are on the
+[Releases page](https://github.com/kynoci/control-desktop/releases). Every release is
+built from this repository by GitHub Actions (`.github/workflows/release.yml`).
+
+| OS | File |
+|---|---|
+| Windows | `*_x64-setup.exe` or `*_x64_en-US.msi` |
+| Ubuntu / Debian | `*_amd64.deb` |
+| Fedora / RHEL | `*.x86_64.rpm` |
+| Any Linux | `*_amd64.AppImage` |
+| macOS (Apple Silicon / Intel) | `*_aarch64.dmg` / `*_x64.dmg` |
+
+## Code signing policy
+
+Free code signing for Windows is provided by [SignPath.io](https://about.signpath.io/),
+certificate by [SignPath Foundation](https://signpath.org/).
+
+- Committers and reviewers: [kynoci members](https://github.com/orgs/kynoci/people)
+- Approvers: [kynoci owners](https://github.com/orgs/kynoci/people)
+
+Only binaries built by this repository's GitHub Actions workflow from its public source
+are signed, and every signing request is manually approved.
+
+## Privacy policy
+
+This program will not transfer any information to other networked systems unless
+specifically requested by the user or the person installing or operating it. It only
+connects to the remote hosts you configure. Connection details are stored locally in
+SQLite and passwords in your operating system's keychain; nothing is sent to kynoci
+or any third party.
+
+---
+
 ## License
 
 GPL-3.0-only © kynoci — see [LICENSE](LICENSE).
